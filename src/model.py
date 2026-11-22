@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from math import ceil, cos, hypot, radians
+from math import ceil, cos, hypot, isfinite, radians
 from functools import lru_cache
 
 BUSINESS = {
@@ -86,10 +86,36 @@ class Network:
 
     @classmethod
     def from_dict(cls, row):
-        return cls(tuple(row["origin"]), tuple(row["bounds"]), tuple(
-            Route(**{**r, "pickup": tuple(r["pickup"]), "dropoff": tuple(r["dropoff"])})
-            for r in row["routes"]
-        ), tuple(row.get("candidates", [])), row.get("diagnostics"))
+        import re
+
+        origin=tuple(row["origin"])
+        bounds=tuple(row["bounds"])
+        if (len(origin)!=2 or not all(isfinite(x) for x in origin)
+                or abs(origin[0])>=85 or abs(origin[1])>180):
+            raise ValueError("航网坐标参考无效")
+        if len(bounds)!=4 or not all(isfinite(x) and abs(x)<=100 for x in bounds):
+            raise ValueError("航网范围超出模拟城区限制")
+        if bounds[0]>=bounds[1] or bounds[2]>=bounds[3]:
+            raise ValueError("航网范围顺序无效")
+        if len(row["routes"])>20:
+            raise ValueError("最多载入 20 条航段")
+        labels=set()
+        routes=[]
+        for data in row["routes"]:
+            route=Route(**{**data,"pickup":tuple(data["pickup"]),"dropoff":tuple(data["dropoff"])})
+            for value in (route.id,route.hub,route.spoke):
+                if not isinstance(value,str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}",value):
+                    raise ValueError("站点或航段编号格式无效")
+            if (route.id in labels or not isfinite(route.km) or not .5<=route.km<=4
+                    or not all(len(point)==2 and all(isfinite(x) for x in point)
+                               for point in (route.pickup,route.dropoff))):
+                raise ValueError("航段重复或几何数据无效")
+            routes.append(route)
+            labels.add(route.id)
+        result=cls(origin,bounds,tuple(routes),tuple(row.get("candidates",[])),row.get("diagnostics"))
+        if any(not result.contains(point) for route in routes for point in (route.pickup,route.dropoff)):
+            raise ValueError("航段端点位于航网范围之外")
+        return result
 
 
 @lru_cache(maxsize=100_000)

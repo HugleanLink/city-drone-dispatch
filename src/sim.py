@@ -221,10 +221,14 @@ class Engine:
                             break
                         return_start=return_land-fly-1
                         spoke_slot=Slot(spoke_pad,touch,return_start+1,"降落、卸货及返程起飞",order.id)
-                        if not cal.free(spoke_pad,touch,spoke_slot.end,prelim):
-                            receive, _ = cal.next([spoke_pad],touch+1,spoke_slot.end-touch,prelim)
+                        receive, usable_pad = cal.next(spoke_pads,touch,spoke_slot.end-touch,prelim)
+                        if not usable_pad:
+                            break
+                        if receive>touch:
                             takeoff=launch+max(1,receive-touch)
                             continue
+                        if usable_pad!=spoke_pad:
+                            spoke_slot=Slot(usable_pad,touch,spoke_slot.end,spoke_slot.activity,order.id)
                         unload,swap_id=cal.next(resources["swap"],return_land+1,2,mount)
                         if not swap_id:
                             break
@@ -241,7 +245,19 @@ class Engine:
                                 takeoff=launch+1
                             continue
                         if not cal.free(battery,aircraft_start,unload+2):
-                            break
+                            needed=unload+2-aircraft_start
+                            retry,_=cal.next([battery],aircraft_start,needed)
+                            if retry>END:
+                                break
+                            if mount:
+                                new_mount,swap=cal.next(resources["swap"],retry,2)
+                                if not swap:
+                                    break
+                                mount=(Slot(swap,new_mount,new_mount+2,"装电",order.id),)
+                                takeoff=max(launch+1,new_mount+2)
+                            else:
+                                takeoff=max(launch+1,retry)
+                            continue
                         charge,charger=cal.next(resources["charge"],unload+2,24)
                         charged=charge+24 if charger else END+1
                         # A future restriction blocks reuse, not protected work already in flight.

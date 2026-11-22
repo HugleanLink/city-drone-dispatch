@@ -15,6 +15,8 @@ python -m src.cli serve
 
 浏览器打开 `http://127.0.0.1:8501`。导航中的 **新单决策** 可从空队列开始。**运行控制** 提供常态、高需求、三单试排和备用电池扰动样例。打开 **回放与对照** 可查看实际交付、运行四策略及下载运行包。
 
+Windows 便携包在项目目录 `dist/DroneDispatch` 生成。构建端安装 PyInstaller 后运行 `./build_windows.ps1`。分享时保留整个目录，双击 `DroneDispatch.exe`，浏览器打开本机应用。关闭启动窗口结束本次服务。
+
 ## 数据
 
 `data/demo_orders.csv.gz` 包含 **592,667 条独立生成的模拟记录**。模拟点位用于验证规划和调度方法，站点与航段均为研究设定。生成脚本固定随机种子，可运行 `python -m src.demo_data` 复现。默认从完整数据的联合分布随机抽取 4,000 条规划订单，运行时抽取 201 或 302 条运营订单。
@@ -37,6 +39,6 @@ python -m pytest -q
 
 ## 部署
 
-在 [Streamlit Community Cloud](https://share.streamlit.io/) 选择此仓库、`main` 分支、`streamlit_app.py` 入口，Python 版本选择 3.12。依赖由仓库根目录的 `requirements.txt` 安装。默认场景随仓库部署。
+在 [Streamlit Community Cloud](https://share.streamlit.io/) 选择此仓库、`main` 分支、`streamlit_app.py` 入口，Python 版本选择 3.12。依赖由仓库根目录的 `requirements.txt` 安装。默认航网和规划样本随仓库部署，打开新单决策页可立即开始。数据页按需读取完整的公开模拟 CSV。
 
 [Streamlit 部署说明](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy)

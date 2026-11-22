@@ -23,7 +23,12 @@ def _minute(values):
 
 def prepare(source, mapping=None, encoding="utf-8-sig"):
     if isinstance(source, bytes):
-        source = io.BytesIO(gzip.decompress(source) if source[:2] == b"\x1f\x8b" else source)
+        if source[:2] == b"\x1f\x8b":
+            with gzip.GzipFile(fileobj=io.BytesIO(source)) as archive:
+                source=archive.read(200*1024*1024+1)
+            if len(source)>200*1024*1024:
+                raise ValueError("压缩 CSV 解压后超过 200 MB")
+        source=io.BytesIO(source)
     df = pd.read_csv(source, encoding=encoding, dtype="string").rename(columns=mapping or {})
     required = ["customer_pay_time", *KEYS[1:5]]
     if missing := set(required)-set(df):

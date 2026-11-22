@@ -7,6 +7,7 @@ data/generated/
 runs/
 build/
 dist/
+*.spec
 *.sqlite*
 .env
 *.toml.local

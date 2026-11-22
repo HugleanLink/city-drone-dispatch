@@ -1,0 +1,510 @@
+{
+  "origin": [
+    30.216756750000002,
+    120.18
+  ],
+  "bounds": [
+    -8.0,
+    8.0,
+    -8.5,
+    8.5
+  ],
+  "routes": [
+    {
+      "id": "H04-S06",
+      "hub": "H04",
+      "spoke": "S06",
+      "pickup": [
+        30.2054955,
+        120.1747876
+      ],
+      "dropoff": [
+        30.21,
+        120.18
+      ],
+      "km": 0.7070808773259561,
+      "coverage": 173,
+      "hub_site": "30.20549550,120.17478760",
+      "spoke_site": "30.21000000,120.18000000"
+    },
+    {
+      "id": "H20-S20",
+      "hub": "H20",
+      "spoke": "S20",
+      "pickup": [
+        30.2325225,
+        120.2269118
+      ],
+      "dropoff": [
+        30.237027,
+        120.2216994
+      ],
+      "km": 0.7070808773249925,
+      "coverage": 151,
+      "hub_site": "30.23252250,120.22691180",
+      "spoke_site": "30.23702700,120.22169940"
+    },
+    {
+      "id": "H03-S02",
+      "hub": "H03",
+      "spoke": "S02",
+      "pickup": [
+        30.2325225,
+        120.1539379
+      ],
+      "dropoff": [
+        30.2415315,
+        120.1487255
+      ],
+      "km": 1.1180169350598481,
+      "coverage": 108,
+      "hub_site": "30.23252250,120.15393790",
+      "spoke_site": "30.24153150,120.14872550"
+    },
+    {
+      "id": "H03-S06",
+      "hub": "H03",
+      "spoke": "S06",
+      "pickup": [
+        30.2325225,
+        120.1539379
+      ],
+      "dropoff": [
+        30.21,
+        120.18
+      ],
+      "km": 3.5354111688322956,
+      "coverage": 98,
+      "hub_site": "30.23252250,120.15393790",
+      "spoke_site": "30.21000000,120.18000000"
+    },
+    {
+      "id": "H04-S17",
+      "hub": "H04",
+      "spoke": "S17",
+      "pickup": [
+        30.2054955,
+        120.1747876
+      ],
+      "dropoff": [
+        30.182973,
+        120.2060621
+      ],
+      "km": 3.9049640538289414,
+      "coverage": 96,
+      "hub_site": "30.20549550,120.17478760",
+      "spoke_site": "30.18297300,120.20606210"
+    }
+  ],
+  "candidates": [
+    {
+      "id": "H01",
+      "location": [
+        30.182973,
+        120.1383006
+      ],
+      "count": 16,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H02",
+      "location": [
+        30.237027,
+        120.1487255
+      ],
+      "count": 29,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H03",
+      "location": [
+        30.2325225,
+        120.1539379
+      ],
+      "count": 24,
+      "role": "Hub",
+      "active": true
+    },
+    {
+      "id": "H04",
+      "location": [
+        30.2054955,
+        120.1747876
+      ],
+      "count": 27,
+      "role": "Hub",
+      "active": true
+    },
+    {
+      "id": "H05",
+      "location": [
+        30.21,
+        120.1747876
+      ],
+      "count": 31,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H06",
+      "location": [
+        30.2145045,
+        120.1747876
+      ],
+      "count": 29,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H07",
+      "location": [
+        30.2054955,
+        120.18
+      ],
+      "count": 34,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H08",
+      "location": [
+        30.21,
+        120.18
+      ],
+      "count": 33,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H09",
+      "location": [
+        30.2145045,
+        120.18
+      ],
+      "count": 25,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H10",
+      "location": [
+        30.219009,
+        120.18
+      ],
+      "count": 22,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H11",
+      "location": [
+        30.2054955,
+        120.1852124
+      ],
+      "count": 21,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H12",
+      "location": [
+        30.21,
+        120.1852124
+      ],
+      "count": 43,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H13",
+      "location": [
+        30.2145045,
+        120.1852124
+      ],
+      "count": 25,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H14",
+      "location": [
+        30.255045,
+        120.1904248
+      ],
+      "count": 14,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H15",
+      "location": [
+        30.182973,
+        120.2112745
+      ],
+      "count": 11,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H16",
+      "location": [
+        30.2325225,
+        120.2164869
+      ],
+      "count": 22,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H17",
+      "location": [
+        30.237027,
+        120.2164869
+      ],
+      "count": 34,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H18",
+      "location": [
+        30.237027,
+        120.2216994
+      ],
+      "count": 23,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H19",
+      "location": [
+        30.2415315,
+        120.2216994
+      ],
+      "count": 27,
+      "role": "Hub",
+      "active": false
+    },
+    {
+      "id": "H20",
+      "location": [
+        30.2325225,
+        120.2269118
+      ],
+      "count": 22,
+      "role": "Hub",
+      "active": true
+    },
+    {
+      "id": "S01",
+      "location": [
+        30.182973,
+        120.1383006
+      ],
+      "count": 13,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S02",
+      "location": [
+        30.2415315,
+        120.1487255
+      ],
+      "count": 17,
+      "role": "Spoke",
+      "active": true
+    },
+    {
+      "id": "S03",
+      "location": [
+        30.21,
+        120.1695752
+      ],
+      "count": 17,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S04",
+      "location": [
+        30.2145045,
+        120.1747876
+      ],
+      "count": 18,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S05",
+      "location": [
+        30.2054955,
+        120.18
+      ],
+      "count": 22,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S06",
+      "location": [
+        30.21,
+        120.18
+      ],
+      "count": 24,
+      "role": "Spoke",
+      "active": true
+    },
+    {
+      "id": "S07",
+      "location": [
+        30.2145045,
+        120.18
+      ],
+      "count": 18,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S08",
+      "location": [
+        30.2054955,
+        120.1852124
+      ],
+      "count": 14,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S09",
+      "location": [
+        30.21,
+        120.1852124
+      ],
+      "count": 19,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S10",
+      "location": [
+        30.2145045,
+        120.1852124
+      ],
+      "count": 20,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S11",
+      "location": [
+        30.219009,
+        120.1852124
+      ],
+      "count": 14,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S12",
+      "location": [
+        30.2325225,
+        120.1852124
+      ],
+      "count": 1,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S13",
+      "location": [
+        30.255045,
+        120.1852124
+      ],
+      "count": 15,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S14",
+      "location": [
+        30.2145045,
+        120.1904248
+      ],
+      "count": 19,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S15",
+      "location": [
+        30.255045,
+        120.1904248
+      ],
+      "count": 15,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S16",
+      "location": [
+        30.255045,
+        120.1956373
+      ],
+      "count": 16,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S17",
+      "location": [
+        30.182973,
+        120.2060621
+      ],
+      "count": 15,
+      "role": "Spoke",
+      "active": true
+    },
+    {
+      "id": "S18",
+      "location": [
+        30.182973,
+        120.2112745
+      ],
+      "count": 14,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S19",
+      "location": [
+        30.2325225,
+        120.2164869
+      ],
+      "count": 18,
+      "role": "Spoke",
+      "active": false
+    },
+    {
+      "id": "S20",
+      "location": [
+        30.237027,
+        120.2216994
+      ],
+      "count": 17,
+      "role": "Spoke",
+      "active": true
+    }
+  ],
+  "diagnostics": {
+    "planning": 4000,
+    "potential": 1812,
+    "covered": 626,
+    "routes": 5,
+    "first_p90_km": 2.4999962042192694,
+    "last_p90_km": 2.4999962043121946,
+    "nominal_air_faster": 54
+  }
+}

@@ -44,6 +44,8 @@ def run_batch(profile,network,seeds,scenarios,*,hub=None,settings=None,cancelled
             prototype=Engine(network,settings=run_settings)
             hub=hub or min(prototype.hubs,default=None)
             event=None
+            if scenario in ("battery","aircraft","pad") and not hub:
+                raise ValueError("资源受限场景需要至少一个启用 Hub")
             if scenario in ("battery","aircraft","pad") and hub:
                 route=next(r for r in network.routes if r.hub==hub)
                 site=(route.hub_site or route.hub) if scenario=="pad" else hub

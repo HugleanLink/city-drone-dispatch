@@ -40,9 +40,10 @@ class RunStore:
                 CREATE TABLE IF NOT EXISTS reservations (resource TEXT, start INTEGER, end INTEGER, body TEXT);
                 CREATE INDEX IF NOT EXISTS decisions_by_order ON decisions(order_id, minute);
             """)
+            conn.execute("BEGIN IMMEDIATE")
             current=conn.execute("SELECT version FROM runs WHERE id=?",(run.run_id,)).fetchone()
-            if current and current[0]>run.version:
-                raise ValueError("运行状态已更新，请重新载入")
+            if current and current[0]!=getattr(run,"saved_version",None):
+                raise ValueError("运行状态已由另一个窗口更新，请重新载入")
             conn.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?)",
                          (run.run_id,run.version,datetime.now(timezone.utc).isoformat(),encode(snapshot)))
             conn.executemany("INSERT OR REPLACE INTO orders VALUES (?,?,?)",
@@ -58,6 +59,8 @@ class RunStore:
             conn.executemany("INSERT INTO reservations VALUES (?,?,?,?)",
                 ((resource,slot["start"],slot["end"],encode(slot)) for resource,slots in snapshot["slots"].items() for slot in slots))
 
+        run.saved_version=run.version
+
     def load(self,id):
         path=self.path(id)
         if not path.is_file():
@@ -66,7 +69,9 @@ class RunStore:
             row=conn.execute("SELECT snapshot FROM runs WHERE id=?",(id,)).fetchone()
         if not row:
             raise ValueError("运行记录不完整")
-        return Engine.restore(json.loads(row[0]))
+        run=Engine.restore(json.loads(row[0]))
+        run.saved_version=run.version
+        return run
 
     def list(self):
         return sorted((d.name for d in self.root.iterdir()

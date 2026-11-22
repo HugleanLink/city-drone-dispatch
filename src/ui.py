@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import tempfile
@@ -24,7 +25,7 @@ from .cli import profile_extent
 from .data import generate, new_order, prepare, rng
 from .examples import battery_pair, three_orders
 from .metrics import metrics, paired
-from .model import BUSINESS, END, LAST_ARRIVAL, MODES, START, STRATEGIES, Network
+from .model import BUSINESS, END, LAST_ARRIVAL, MODES, START, STRATEGIES, Network, Order
 from .network import build
 from .sim import Engine
 from .storage import RunStore, encode
@@ -46,10 +47,10 @@ def public_profile():
 
 @st.cache_resource(show_spinner=False)
 def public_scenario():
-    profile=public_profile()
-    planning=generate(profile,4000,101,"planning")
-    network=build(planning,profile.origin,extent=profile_extent(profile))
-    return planning,network
+    with gzip.open(ROOT/"data/demo_planning.json.gz","rt",encoding="utf-8") as file:
+        planning=[Order.from_dict(row) for row in json.load(file)]
+    saved=Network.from_dict(json.loads((ROOT/"data/demo_network.json").read_text(encoding="utf-8")))
+    return planning,saved
 
 
 @st.cache_resource
@@ -104,7 +105,6 @@ def network():
     if "network" not in s:
         with st.spinner("生成规划需求和航网…"):
             if "planning" not in s and ("profile" not in s or s.origin_name=="公开模拟 CSV"):
-                s.profile=public_profile()
                 s.planning,s.network=public_scenario()
             else:
                 p=profile()
@@ -112,10 +112,6 @@ def network():
                     s.planning=generate(p,4000,101,"planning")
                 s.network=build(s.planning,p.origin,extent=profile_extent(p))
     return s.network
-
-
-def active_network():
-    return state().run.network if state().get("run") else network()
 
 
 def get_run():
@@ -160,7 +156,7 @@ def network_chart(net, *, selected=None, candidate=False, run=None, height=405):
                           marker=dict(color=color,size=[11 if r["active"] else 6 for r in rows],
                                       opacity=[1 if r["active"] else .35 for r in rows],symbol=symbol),
                           customdata=[[r["id"],r["count"]] for r in rows],
-                          hovertemplate="%{customdata[0]} · %{{customdata[1]}} 单<extra></extra>".replace("{{","{").replace("}}","}")))
+                          hovertemplate="%{customdata[0]} · %{customdata[1]} 单<extra></extra>"))
     if selected:
         xy=[net.xy(p) for p in selected]
         fig.add_trace(go.Scatter(x=[p[0] for p in xy],y=[p[1] for p in xy],mode="markers+text",
@@ -252,7 +248,7 @@ def decision_page():
             with st.form("new_order"):
                 minute=max(START,run.now+1)
                 default_time=Time(minute//60,minute%60)
-                selected_time=st.time_input("下单时间",default_time,step=60)
+                selected_time=st.time_input("下单时间",default_time,step=60,key=f"order_clock_{run.run_id}_{minute}")
                 a,b=st.columns(2)
                 for col,key,label,loc in ((a,"pickup","取货点",default[0]),(b,"dropoff","目的地",default[1])):
                     with col:
@@ -453,6 +449,15 @@ def data_page():
         business=p.rows.groupby("biz_line")["count"].sum()
         st.bar_chart(pd.Series(business.to_numpy(),index=[BUSINESS[i][0] for i in business.index]),
                      color="#274C73",height=200)
+    with st.expander("查看取送点分布"):
+        from plotly import express as px
+        field=st.radio("端点",["pickup","dropoff"],format_func={"pickup":"取货点","dropoff":"送达点"}.get,horizontal=True)
+        points=p.rows.groupby([field+"_latitude",field+"_longitude"],as_index=False)["count"].sum()
+        points=points.nlargest(1800,"count")
+        fig=px.scatter(points,x=field+"_longitude",y=field+"_latitude",size="count",color="count",
+                       labels={field+"_longitude":"经度",field+"_latitude":"纬度","count":"订单量"},
+                       color_continuous_scale="Teal",height=330)
+        st.plotly_chart(fig,width="stretch")
     with st.form("generate_case"):
         c=st.columns(3)
         purpose=c[0].selectbox("订单用途",["planning","operation","heavy"],format_func={"planning":"规划","operation":"运营","heavy":"高需求"}.get)
@@ -489,6 +494,7 @@ def network_page():
                 planning=generate(p,count,101,"planning")
             s.network=build(planning,p.origin,max_hubs=hubs,max_spokes=spokes,max_routes=routes,extent=profile_extent(p))
             s.planning=planning
+            s.pop("covered",None)
     net=network()
     d=net.diagnostics or {}
     for col,label,value in zip(st.columns(4),("规划订单","潜在适飞","联网覆盖","启用航段"),
@@ -511,9 +517,10 @@ def network_page():
         rid=st.selectbox("查看结构覆盖订单",["仅地面",*[r.id for r in net.routes]])
         if st.button("列出对应订单"):
             match=[match_order(net,o) for o in s.planning if net.contains(o.pickup) and net.contains(o.dropoff)]
-            covered=[asdict(o) for o in match if o.route_id==(None if rid=="仅地面" else rid)]
-            st.dataframe(covered[:100],hide_index=True)
-            st.download_button("下载完整覆盖明细",as_csv(covered),"coverage.csv","text/csv")
+            s.covered=[asdict(o) for o in match if o.route_id==(None if rid=="仅地面" else rid)]
+        if "covered" in s:
+            st.dataframe(s.covered[:100],hide_index=True)
+            st.download_button("下载完整覆盖明细",as_csv(s.covered),"coverage.csv","text/csv")
     a,b=st.columns(2)
     a.download_button("保存航网 JSON",encode(asdict(net)),"network.json","application/json")
     imported=b.file_uploader("载入已保存航网",type="json",key="network_file")
@@ -521,6 +528,7 @@ def network_page():
         try:
             s.network=Network.from_dict(json.loads(imported.getvalue()))
             s.pop("planning",None)
+            s.pop("covered",None)
             st.success("航网已载入，可在运行控制中创建运行。")
         except (ValueError,TypeError,KeyError) as e: st.error(f"航网文件无法载入：{e}")
 
@@ -652,6 +660,13 @@ def replay_page():
                     index=st.select_slider("定位决策",options=list(range(len(decisions))),value=len(decisions)-1,
                                            format_func=lambda i:f"{hhmm(decisions[i]['minute'])} · {MODES[decisions[i]['mode']]}")
                     show_decision(decisions[index])
+                elif "arrival_estimate" in r:
+                    estimate=r["arrival_estimate"]
+                    st.write(f"到达时估计 · 地面 {hhmm(estimate['ground_eta'])} / 空地 {hhmm(estimate['air_eta'])}")
+                reservations=[asdict(slot) for group in run.cal.slots.values() for slot in group if slot.order==id]
+                if reservations:
+                    with st.expander("实际资源预约"):
+                        st.dataframe(reservations,hide_index=True)
                 records=[{"时刻":hhmm(e["minute"]),"事件":e["type"],"编号":e["id"]}
                          for e in run.log if e["id"]==id]
                 st.dataframe(records,hide_index=True)
