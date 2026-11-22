@@ -50,10 +50,12 @@ def main():
     url=f"http://127.0.0.1:{port}"
     print("城市物流无人机航网规划与空地协同调度系统")
     print(f"打开 {url}。关闭此窗口结束服务。",flush=True)
-    threading.Thread(target=open_when_healthy,args=(url,),daemon=True).start()
+    if os.environ.get("DRONE_DISPATCH_NO_BROWSER")!="1":
+        threading.Thread(target=open_when_healthy,args=(url,),daemon=True).start()
     sys.argv=["streamlit","run",str(assets/"streamlit_app.py"),
               "--server.address","127.0.0.1","--server.port",str(port),
-              "--server.headless","true","--browser.gatherUsageStats","false"]
+              "--global.developmentMode","false","--server.headless","true",
+              "--browser.gatherUsageStats","false"]
     cli.main()
 
 

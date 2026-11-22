@@ -503,8 +503,142 @@
     "potential": 1812,
     "covered": 626,
     "routes": 5,
+    "pickup_clusters": 6,
+    "dropoff_clusters": 3,
+    "pickup_noise": 12,
+    "dropoff_noise": 27,
+    "cluster_flows": [
+      {
+        "pickup": 0,
+        "dropoff": 0,
+        "orders": 372
+      },
+      {
+        "pickup": 1,
+        "dropoff": 0,
+        "orders": 353
+      },
+      {
+        "pickup": 3,
+        "dropoff": 0,
+        "orders": 304
+      },
+      {
+        "pickup": 5,
+        "dropoff": 0,
+        "orders": 200
+      },
+      {
+        "pickup": 4,
+        "dropoff": 1,
+        "orders": 150
+      },
+      {
+        "pickup": 2,
+        "dropoff": 2,
+        "orders": 111
+      },
+      {
+        "pickup": 0,
+        "dropoff": 2,
+        "orders": 104
+      },
+      {
+        "pickup": 2,
+        "dropoff": 0,
+        "orders": 57
+      },
+      {
+        "pickup": 0,
+        "dropoff": 1,
+        "orders": 55
+      },
+      {
+        "pickup": 4,
+        "dropoff": 0,
+        "orders": 41
+      },
+      {
+        "pickup": 1,
+        "dropoff": 2,
+        "orders": 12
+      },
+      {
+        "pickup": 3,
+        "dropoff": 1,
+        "orders": 11
+      },
+      {
+        "pickup": -1,
+        "dropoff": 0,
+        "orders": 8
+      },
+      {
+        "pickup": 4,
+        "dropoff": -1,
+        "orders": 6
+      },
+      {
+        "pickup": 3,
+        "dropoff": -1,
+        "orders": 5
+      },
+      {
+        "pickup": 0,
+        "dropoff": -1,
+        "orders": 5
+      },
+      {
+        "pickup": 2,
+        "dropoff": -1,
+        "orders": 4
+      },
+      {
+        "pickup": 1,
+        "dropoff": -1,
+        "orders": 4
+      },
+      {
+        "pickup": -1,
+        "dropoff": 2,
+        "orders": 4
+      },
+      {
+        "pickup": 5,
+        "dropoff": -1,
+        "orders": 3
+      },
+      {
+        "pickup": 2,
+        "dropoff": 1,
+        "orders": 2
+      },
+      {
+        "pickup": 4,
+        "dropoff": 2,
+        "orders": 1
+      }
+    ],
     "first_p90_km": 2.4999962042192694,
     "last_p90_km": 2.4999962043121946,
     "nominal_air_faster": 54
-  }
+  },
+  "rider_starts": [
+    [
+      30.189729722972974,
+      120.14872333968417
+    ],
+    [
+      30.23477476801802,
+      120.14872333968417
+    ],
+    [
+      30.19423422747748,
+      120.20085110687724
+    ],
+    [
+      30.24378377702703,
+      120.21127666031585
+    ]
+  ]
 }

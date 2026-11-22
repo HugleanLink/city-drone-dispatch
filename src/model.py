@@ -62,6 +62,7 @@ class Network:
     routes: tuple[Route, ...]
     candidates: tuple[dict, ...] = ()
     diagnostics: dict | None = None
+    rider_starts: tuple = ()
 
     def xy(self, point):
         scale = 111 * cos(radians(self.origin[0]))
@@ -112,7 +113,10 @@ class Network:
                 raise ValueError("航段重复或几何数据无效")
             routes.append(route)
             labels.add(route.id)
-        result=cls(origin,bounds,tuple(routes),tuple(row.get("candidates",[])),row.get("diagnostics"))
+        starts=tuple(tuple(point) for point in row.get("rider_starts",[]))
+        if starts and (len(starts)!=4 or not all(len(point)==2 and all(isfinite(x) for x in point) for point in starts)):
+            raise ValueError("骑手起始坐标无效")
+        result=cls(origin,bounds,tuple(routes),tuple(row.get("candidates",[])),row.get("diagnostics"),starts)
         if any(not result.contains(point) for route in routes for point in (route.pickup,route.dropoff)):
             raise ValueError("航段端点位于航网范围之外")
         return result

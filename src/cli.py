@@ -75,6 +75,8 @@ def main():
         network=build(orders,profile.origin if profile else None,extent=profile_extent(profile) if profile else None)
         save(args.out/"network.json",asdict(network))
         save(args.out/"coverage.json",covered_rows(network,orders))
+        save(args.out/"road_graph.json",road_graph(network))
+        pd.DataFrame(network.candidates).to_csv(args.out/"candidates.csv",index=False,encoding="utf-8-sig")
         print(network.diagnostics)
     if args.action=="batch":
         profile=load_profile(args.profile)
@@ -91,6 +93,26 @@ def profile_extent(profile):
     s=profile.rows
     return [(min(s.pickup_latitude.min(),s.dropoff_latitude.min()),min(s.pickup_longitude.min(),s.dropoff_longitude.min())),
             (max(s.pickup_latitude.max(),s.dropoff_latitude.max()),max(s.pickup_longitude.max(),s.dropoff_longitude.max()))]
+
+
+def road_graph(network):
+    left,right,bottom,top=network.bounds
+    x_range=range(round(left*2),round(right*2)+1)
+    y_range=range(round(bottom*2),round(top*2)+1)
+    def code(x,y):
+        return f"{x}:{y}"
+    nodes=[]
+    edges=[]
+    for x in x_range:
+        for y in y_range:
+            lat,lon=network.latlon(x/2,y/2)
+            id=code(x,y)
+            nodes.append(dict(id=id,x=x/2,y=y/2,lat=lat,lon=lon))
+            for xx,yy in ((x+1,y),(x,y+1)):
+                if xx in x_range and yy in y_range:
+                    edges.append({"from":id,"to":code(xx,yy),"length_km":.5})
+    return {"schema_version":1,"origin":network.origin,"bounds":network.bounds,
+            "coordinate_system":"WGS84","step_km":.5,"nodes":nodes,"edges":edges}
 
 
 if __name__=="__main__":

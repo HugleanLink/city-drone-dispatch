@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import re
@@ -83,6 +84,19 @@ class RunStore:
         with zipfile.ZipFile(output,"w",zipfile.ZIP_DEFLATED) as z:
             z.writestr("snapshot.json",encode(run.snapshot()))
             z.writestr("events.jsonl","\n".join(encode(e) for e in run.log))
+            z.writestr("decisions.jsonl","\n".join(encode(e) for e in run.decisions))
+            from .metrics import metrics
+            z.writestr("metrics.json",encode(metrics(run)))
+            rows=io.StringIO()
+            writer=csv.writer(rows)
+            writer.writerow(["order_id","mode","resource","activity","planned_start","planned_end","actual_elapsed"])
+            for resource,slots in run.cal.slots.items():
+                for slot in slots:
+                    if slot.order in run.records:
+                        mode=run.records[slot.order]["mode"]
+                        actual=max(0,min(slot.end,run.now)-slot.start)
+                        writer.writerow([slot.order,mode,resource,slot.activity,slot.start,slot.end,actual])
+            z.writestr("calibration_stages.csv",rows.getvalue().encode("utf-8-sig"))
             z.write(self.path(run.run_id),"orders.sqlite3")
         return output.getvalue()
 

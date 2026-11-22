@@ -512,6 +512,11 @@ def network_page():
     else:
         network_chart(net,candidate=show_candidates)
     st.dataframe(route_frame(net),hide_index=True,width="stretch")
+    if d.get("cluster_flows"):
+        with st.expander("取送需求簇及流量"):
+            st.write(f"取货需求簇 {d['pickup_clusters']} 个，送达需求簇 {d['dropoff_clusters']} 个。编号 -1 表示离散点。")
+            st.dataframe(d["cluster_flows"],hide_index=True,column_config={"pickup":"取货簇","dropoff":"送达簇","orders":"单量"})
+            st.download_button("下载起讫簇流量",as_csv(d["cluster_flows"]),"cluster_flows.csv","text/csv")
     if net.routes and "planning" in s:
         from .model import match_order
         rid=st.selectbox("查看结构覆盖订单",["仅地面",*[r.id for r in net.routes]])

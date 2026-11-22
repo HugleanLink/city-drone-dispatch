@@ -4,9 +4,11 @@
 
 本系统根据订单需求生成固定航网，并在给定骑手、无人机、电池和起降位的条件下，为新订单提供地面直送、空地接驳或等待的建议。支持比较资源扰动前后同一订单的结果，以及纯地面、固定分流、逐单动态和多订单试排四种策略。
 
+[打开 Streamlit 在线演示](https://city-drone-dispatch.streamlit.app/)
+
 ## 启动
 
-需要 Python 3.12 或 3.13。首次安装后可双击 Windows 的 `启动系统.cmd`。
+支持 Python 3.12 至 3.14。首次安装后可双击 Windows 的 `启动系统.cmd`。
 
 ```powershell
 python -m pip install -r requirements.txt

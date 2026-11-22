@@ -1,6 +1,7 @@
 streamlit==1.57.0
 streamlit-folium==0.27.2
-numpy==2.2.6
+numpy==2.2.6; python_version < "3.14"
+numpy==2.4.4; python_version >= "3.14"
 pandas==3.0.2
 scikit-learn==1.8.0
 folium==0.20.0

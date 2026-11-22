@@ -96,7 +96,8 @@ class Engine:
         left,right,bottom,top = self.network.bounds
         for zone,(x,y) in enumerate(((left/2,bottom/2),(left/2,top/2),(right/2,bottom/2),(right/2,top/2)),1):
             for rider in ids("rider",str(zone),self.settings["riders"]):
-                self.cal.tails[rider] = (start,self.network.latlon(round(x*2)/2,round(y*2)/2))
+                point=self.network.rider_starts[zone-1] if self.network.rider_starts else self.network.latlon(round(x*2)/2,round(y*2)/2)
+                self.cal.tails[rider] = (start,point)
         for route in self.routes.values():
             hub_site = route.hub_site or route.hub
             spoke_site = route.spoke_site or route.spoke

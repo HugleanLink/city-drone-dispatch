@@ -1,5 +1,6 @@
 from dataclasses import asdict, replace
 from math import ceil, floor
+from collections import Counter
 import numpy as np
 from sklearn.cluster import DBSCAN
 from .model import Network, Route, minutes, match_order
@@ -17,7 +18,7 @@ def _points(network, endpoints, prefix):
         representatives.append(min(map(tuple, cluster), key=lambda p:(np.linalg.norm(np.array(p)-center), *p)))
     selected = list(dict.fromkeys(representatives+[tuple(p) for p,_ in high_frequency]))[:20]
     frequency = {tuple(p):int(n) for p,n in high_frequency}
-    return [(f"{prefix}{i+1:02}", network.latlon(*p), frequency[p]) for i,p in enumerate(sorted(selected))]
+    return [(f"{prefix}{i+1:02}", network.latlon(*p), frequency[p]) for i,p in enumerate(sorted(selected))], labels
 
 
 def build(orders, origin=None, *, max_hubs=3, max_spokes=4, max_routes=6, extent=None):
@@ -32,11 +33,18 @@ def build(orders, origin=None, *, max_hubs=3, max_spokes=4, max_routes=6, extent
     bounds = (floor(min(xs)*2)/2-.5, ceil(max(xs)*2)/2+.5,
               floor(min(ys)*2)/2-.5, ceil(max(ys)*2)/2+.5)
     base = replace(base, bounds=bounds)
+    starts=[]
+    pickup=np.array([base.xy(o.pickup) for o in orders])
+    for east,north in ((False,False),(False,True),(True,False),(True,True)):
+        local=pickup[((pickup[:,0]>=0)==east)&((pickup[:,1]>=0)==north)]
+        x,y=local.mean(axis=0) if len(local) else (bounds[1 if east else 0]/2,bounds[3 if north else 2]/2)
+        starts.append(base.latlon(ceil(x*2-.5)/2,ceil(y*2-.5)/2))
+    base=replace(base,rider_starts=tuple(starts))
     potential = [o for o in orders if o.kg<=2 and .5<=base.straight(o.pickup,o.dropoff)<=5]
     if not potential:
         return replace(base, diagnostics={"planning":len(orders),"potential":0,"covered":0,"routes":0})
-    hubs = _points(base,[o.pickup for o in potential],"H")
-    spokes = _points(base,[o.dropoff for o in potential],"S")
+    hubs, origins = _points(base,[o.pickup for o in potential],"H")
+    spokes, destinations = _points(base,[o.dropoff for o in potential],"S")
     direct = np.array([minutes(base.road(o.pickup,o.dropoff),18)+2 for o in potential])
     legs = []
     for hid, hub, _ in hubs:
@@ -75,7 +83,11 @@ def build(orders, origin=None, *, max_hubs=3, max_spokes=4, max_routes=6, extent
                        for i,point,n in group)
     base=replace(base,routes=tuple(chosen),candidates=candidates)
     stats = {"planning":len(orders),"potential":len(potential),
-             "covered":int(covered.sum()),"routes":len(chosen)}
+             "covered":int(covered.sum()),"routes":len(chosen),
+             "pickup_clusters":len(set(origins)-{-1}),"dropoff_clusters":len(set(destinations)-{-1}),
+             "pickup_noise":int((origins==-1).sum()),"dropoff_noise":int((destinations==-1).sum()),
+             "cluster_flows":[{"pickup":int(a),"dropoff":int(b),"orders":int(n)}
+                              for (a,b),n in Counter(zip(origins,destinations)).most_common()]}
     connections, savings = [], []
     route_by_id={r.id:r for r in chosen}
     for order in potential:
