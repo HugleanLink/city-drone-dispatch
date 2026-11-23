@@ -1,11 +1,12 @@
 import heapq
 from bisect import bisect_right, insort
 from operator import attrgetter
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, replace
 from math import isfinite
 from uuid import uuid4
 
+from .lookahead import POLICY, choose
 from .model import (BUSINESS, END, LAST_ARRIVAL, START, STRATEGIES, Network, Order,
                     ground_time, match_order, minutes)
 
@@ -105,6 +106,11 @@ class Engine:
         self.routes = {r.id:r for r in network.routes}
         self.retry_at = start
         self.rider_index = {}
+        self.lookahead_policy = POLICY
+        self.lookahead_stats = Counter()
+        self.lookahead_wait_until = {}
+        self.lookahead_wait_spent = {}
+        self.lookahead_bypasses = {}
         self._resources(start)
         for order in orders:
             self.add(order)
@@ -583,6 +589,31 @@ class Engine:
                     choice=self._best(plans)
                 if choice and choice.first > self.now:
                     self.retry_at = min(self.retry_at, choice.first)
+                rolling = self.strategy == "lookahead" and self.lookahead_policy is not None and (
+                    self.ground_model or o.deadline is None)
+                if rolling:
+                    until = self.lookahead_wait_until.get(o.id, self.now)
+                    if until > self.now:
+                        self.retry_at = min(self.retry_at, until)
+                        continue
+                    if choice and choice.first == self.now:
+                        action = choose(self, o, choice, cancelled)
+                        if cancelled():
+                            return
+                        if action.until is not None:
+                            self.lookahead_wait_until[o.id] = action.until
+                            self.lookahead_wait_spent[o.id] = self.lookahead_wait_spent.get(o.id, 0) + action.until-self.now
+                            self.lookahead_stats["active_wait_minutes"] += action.until-self.now
+                            self.retry_at = min(self.retry_at, action.until)
+                            break
+                        if action.order.id != o.id:
+                            self.lookahead_bypasses[o.id] = self.lookahead_bypasses.get(o.id, 0) + 1
+                        plan = action.plan
+                        self._intent(action.order, {"order": action.order.id, "minute": self.now, "version": self.version,
+                            "mode": plan.mode, "air_route_id": plan.route, "lookahead_action": action.kind, "branches": []})
+                        dispatched = self._commit(action.order, plan, cancelled)
+                        break
+                    continue
                 can_start=self.opts(o,force=True,cancelled=cancelled) if self.strategy=="lookahead" and choice and choice.first!=self.now else None
                 if self.strategy=="lookahead" and (choice and choice.first==self.now or can_start and any(can_start)):
                     others=[item["order"] for key,item in self.records.items() if key!=o.id and item["status"] in ("waiting","unready")]
@@ -752,13 +783,17 @@ class Engine:
                 "seq":self.seq,"events":self.events,"requests":self.requests,
                 "records":{k:{**r,"order":asdict(r["order"])} for k,r in self.records.items()},
                 "slots":{k:[asdict(s) for s in slots] for k,slots in self.cal.slots.items()},
-                "limits":dict(self.cal.limits),"tails":self.cal.tails,"decisions":self.decisions,"log":self.log}
+                "limits":dict(self.cal.limits),"tails":self.cal.tails,"decisions":self.decisions,"log":self.log,
+                "lookahead_policy": asdict(self.lookahead_policy) if self.lookahead_policy is not None else None,
+                "lookahead_stats": dict(self.lookahead_stats), "lookahead_wait_until": self.lookahead_wait_until,
+                "lookahead_wait_spent": self.lookahead_wait_spent, "lookahead_bypasses": self.lookahead_bypasses}
 
     @classmethod
     def restore(cls,obj, fork=False):
         if obj["schema_version"]!=1:
             raise ValueError("运行包版本不支持")
         from .calibration import GroundTimes
+        from .lookahead import Policy
 
         calibration = obj.get("ground_model")
         run=cls(Network.from_dict(obj["network"]),strategy=obj["strategy"],settings=obj["settings"],
@@ -779,4 +814,9 @@ class Engine:
         run.cal.limits.update(obj["limits"])
         run.cal.tails={k:(v[0],tuple(v[1])) for k,v in obj["tails"].items()}
         run.decisions,run.log=obj["decisions"],obj["log"]
+        if "lookahead_policy" in obj:
+            policy = obj["lookahead_policy"]
+            run.lookahead_policy = Policy(**policy) if policy is not None else None
+        for key in ("lookahead_stats", "lookahead_wait_until", "lookahead_wait_spent", "lookahead_bypasses"):
+            getattr(run, key).update(obj.get(key, {}))
         return run

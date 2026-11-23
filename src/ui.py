@@ -615,6 +615,11 @@ def show_diagnostics(rows, suffix):
     with st.expander("耗时、运力与航段诊断"):
         summary, stages, riders, hubs, routes = st.tabs(["耗时分布", "阶段耗时", "骑手班次", "Hub 资源", "执行航段"])
         with summary:
+            search = next((r.get("lookahead_search") for r in rows if r["strategy"] == "lookahead"), None)
+            if search:
+                edited = sum(search.get(kind, 0) for kind in ("ground", "air", "ground_first", "event_wait"))
+                st.caption(f"多订单试排最多比较 {search['window']} 笔其他订单。"
+                           f"联合决策改变 {edited} 次，主动等待 {search.get('active_wait_minutes', 0)} 分钟。")
             st.dataframe([{"策略": STRATEGIES[r["strategy"]], "空间可接入航网": r["air_eligible_orders"],
                            "实际空运送达": r["delivered_air_orders"], "实际地面送达": r["delivered_ground_orders"],
                            "平均耗时": r["mean_minutes"], "P50": r["p50_minutes"], "P90": r["p90_minutes"],

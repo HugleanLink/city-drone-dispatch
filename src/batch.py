@@ -149,6 +149,8 @@ def run_batch(profile, network, seeds, scenarios, *, hub=None, settings=None, or
                 row["rider_breakdown"] = trial[2]
                 if include_orders:
                     row["orders"] = {key: {**item, **routes.get(key, {})} for key, item in trial[0].items()}
+                if strategy == "lookahead" and run.lookahead_policy is not None:
+                    row["lookahead_search"] = {"window": run.lookahead_policy.window, **run.lookahead_stats}
                 row["calibration"] = ground_model.version if ground_model else None
                 row["settings"] = run_settings
                 row["resource_event"] = event and {"kind": event[0], "site": event[1],
