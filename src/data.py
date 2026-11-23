@@ -17,9 +17,20 @@ class Profile:
     single_pool: bool = False
 
 
-def _minute(values):
-    pieces = values.astype("string").str.extract(r"(?:^|[ T])([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$")
-    return pd.to_numeric(pieces[0], errors="coerce")*60 + pd.to_numeric(pieces[1], errors="coerce")
+def _timestamps(values):
+    # An all-clock CSV has at most 1,440 minute labels per column. Parse each
+    # distinct label once and expand it back to the original row positions.
+    positions, unique = pd.factorize(values)
+    labels = pd.Series(unique, dtype="string")
+    pieces = labels.str.extract(r"(?:^|[ T])([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$")
+    minute = pd.to_numeric(pieces[0], errors="coerce")*60 + pd.to_numeric(pieces[1], errors="coerce")
+    minute_lookup = np.r_[minute.to_numpy(dtype=float, na_value=np.nan), np.nan]
+    dates = pd.to_datetime(labels.str.extract(r"^(\d{4}-\d\d-\d\d)")[0],
+                           format="%Y-%m-%d", errors="coerce")
+    date_lookup = np.concatenate([dates.to_numpy(dtype="datetime64[ns]"),
+                                  np.array(["NaT"], dtype="datetime64[ns]")])
+    return (pd.Series(minute_lookup[positions], index=values.index),
+            pd.Series(date_lookup[positions], index=values.index))
 
 
 def prepare(source, mapping=None, encoding="utf-8-sig"):
@@ -35,7 +46,7 @@ def prepare(source, mapping=None, encoding="utf-8-sig"):
     if missing := set(required)-set(df):
         raise ValueError("缺少输入列 " + "、".join(sorted(missing)))
     total = len(df)
-    df["minute"] = _minute(df.customer_pay_time)
+    df["minute"], paid_date = _timestamps(df.customer_pay_time)
     for key in KEYS[1:5]:
         df[key] = pd.to_numeric(df[key], errors="coerce").astype("float64")
     coords = (df.pickup_latitude.between(-90, 90) & df.dropoff_latitude.between(-90, 90)
@@ -65,12 +76,11 @@ def prepare(source, mapping=None, encoding="utf-8-sig"):
     df["weight_kg"] = pd.to_numeric(df.get("weight_kg", pd.Series(np.nan, index=df.index)), errors="coerce").astype(float)
     if (df.weight_kg.notna() & (~np.isfinite(df.weight_kg) | (df.weight_kg <= 0))).any():
         raise ValueError("weight_kg 须为正数")
-    f, a = _minute(df.fetch_time), _minute(df.arrived_time)
+    f, fetch_date = _timestamps(df.fetch_time)
+    a, arrived_date = _timestamps(df.arrived_time)
     pre, drive = (f-df.minute)%1440, (a-f)%1440
     # Explicit calendar dates take precedence over inferred midnight rollover.
-    dates = [pd.to_datetime(df[key].str.extract(r"^(\d{4}-\d\d-\d\d)")[0], errors="coerce")
-             for key in ("customer_pay_time", "fetch_time", "arrived_time")]
-    date_pre, date_drive = (dates[1]-dates[0]).dt.days, (dates[2]-dates[1]).dt.days
+    date_pre, date_drive = (fetch_date-paid_date).dt.days, (arrived_date-fetch_date).dt.days
     pre = (f-df.minute + date_pre*1440).where(date_pre.notna(), pre)
     drive = (a-f + date_drive*1440).where(date_drive.notna(), drive)
     reference = (pre >= 0) & (drive >= 0) & ((pre + drive) <= 180)

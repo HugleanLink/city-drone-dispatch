@@ -1,6 +1,6 @@
 """Empirical ground delivery times estimated from the selected planning source."""
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from math import ceil, cos, floor, radians
 
 import numpy as np
@@ -80,8 +80,12 @@ class GroundTimes:
         return order.arrival + ceil(self.prep.get((order.business, order.arrival // 60),
                                                    self.default_prep.get(order.business, 8)))
 
-    @lru_cache(maxsize=32768)
-    def estimate(self, origin, destination, hour, business):
+    @cached_property
+    def estimate(self):
+        # The cache belongs to this calibration and can be reclaimed with it.
+        return lru_cache(maxsize=32768)(self._estimate)
+
+    def _estimate(self, origin, destination, hour, business):
         lat, lon = self.origin
         scale = 111*cos(radians(lat))/CELL
         fields = dict(period=int(np.searchsorted(PERIODS, hour, side="right")), hour=hour, business=business,

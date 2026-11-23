@@ -1,4 +1,4 @@
-"""Streamlit entry point for network planning and delivery efficiency comparison."""
+"""Streamlit entry point for CSV ingestion, network planning and delivery efficiency."""
 
 from src.ui import main
 

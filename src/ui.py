@@ -152,7 +152,8 @@ def day_ranges(group_count, source):
 def data_panel(rules, settings):
     s = st.session_state
     st.subheader("导入与建网")
-    upload = st.file_uploader("导入运行数据", type=["csv", "gz"], key="data_file")
+    upload = st.file_uploader("导入运行数据", type=["csv", "gz"], key="data_file",
+                              help="大文件可先压缩为 CSV.GZ，以减少传输时间。")
     if not upload:
         s.upload_token = None
         s.profile = s.profile_key = None
@@ -165,13 +166,14 @@ def data_panel(rules, settings):
         try:
             with st.spinner("校验 CSV 并统计有效订单…"):
                 payload = upload.getvalue()
-                try:
-                    profile = prepare(payload)
-                except UnicodeDecodeError:
-                    profile = prepare(payload, encoding="gb18030")
                 fingerprint = hashlib.sha256(payload).hexdigest()
-            s.profile, s.profile_key = profile, fingerprint
-            s.profile_counts = source_counts(profile)
+                if s.profile is None or s.profile_key != fingerprint:
+                    try:
+                        profile = prepare(payload)
+                    except UnicodeDecodeError:
+                        profile = prepare(payload, encoding="gb18030")
+                    s.profile, s.profile_key = profile, fingerprint
+                    s.profile_counts = source_counts(profile)
         except DATA_ERRORS as error:
             s.upload_error = f"导入失败 · {error}"
     if s.upload_error:
