@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from math import ceil, cos, hypot, isfinite, radians
+from math import asin, ceil, cos, hypot, isfinite, radians, sin, sqrt
 from functools import lru_cache
 
 BUSINESS = {
@@ -32,6 +32,7 @@ class Order:
     route_id: str | None = None
     eligibility: str = "未匹配"
     source: str = "generated"
+    reference_minutes: float | None = None
 
     @property
     def ground_only(self):
@@ -56,6 +57,33 @@ class Route:
 
 
 @dataclass(frozen=True)
+class FlightRules:
+    weight: float = 2.
+    order_min: float = .5
+    order_max: float = 5.
+    access_km: float = 2.5
+    leg_min: float = .5
+    leg_max: float = 4.
+    report: bool = False
+    exclude_group_meal: bool = False
+
+    def __post_init__(self):
+        values = (self.weight, self.order_min, self.order_max, self.access_km, self.leg_min, self.leg_max)
+        if not all(isfinite(value) for value in values) or not (
+            self.weight > 0 and 0 <= self.order_min < self.order_max and self.access_km > 0
+            and 0 < self.leg_min < self.leg_max
+        ):
+            raise ValueError("请检查重量、距离区间和接驳范围")
+
+
+@lru_cache(maxsize=100_000)
+def haversine(a, b):
+    lat1, lon1, lat2, lon2 = map(radians, (*a, *b))
+    h = sin((lat2-lat1)/2)**2 + cos(lat1)*cos(lat2)*sin((lon2-lon1)/2)**2
+    return 2 * 6371 * asin(sqrt(min(1., h)))
+
+
+@dataclass(frozen=True)
 class Network:
     origin: tuple[float, float]
     bounds: tuple[float, float, float, float]
@@ -63,6 +91,25 @@ class Network:
     candidates: tuple[dict, ...] = ()
     diagnostics: dict | None = None
     rider_starts: tuple = ()
+    rules: FlightRules = FlightRules()
+
+    def distance(self, a, b):
+        if not self.rules.report:
+            return self.straight(a, b)
+        return haversine(a, b)
+
+    def access(self, a, b):
+        return self.distance(a, b) if self.rules.report else self.road(a, b)
+
+    def rejection(self, order):
+        rules = self.rules
+        if order.kg > rules.weight:
+            return f"包裹超过 {rules.weight:g} kg"
+        if not rules.order_min <= self.distance(order.pickup, order.dropoff) <= rules.order_max:
+            return f"取送直线距离不在 {rules.order_min:g} 至 {rules.order_max:g} km"
+        if rules.exclude_group_meal and order.business == "pinhaofan":
+            return "当前选址规则将拼好饭分配给地面配送"
+        return None
 
     def xy(self, point):
         scale = 111 * cos(radians(self.origin[0]))
@@ -98,8 +145,7 @@ class Network:
             raise ValueError("航网范围超出模拟城区限制")
         if bounds[0]>=bounds[1] or bounds[2]>=bounds[3]:
             raise ValueError("航网范围顺序无效")
-        if len(row["routes"])>20:
-            raise ValueError("最多载入 20 条航段")
+        rules = FlightRules(**row.get("rules", {}))
         labels=set()
         routes=[]
         for data in row["routes"]:
@@ -107,7 +153,7 @@ class Network:
             for value in (route.id,route.hub,route.spoke):
                 if not isinstance(value,str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}",value):
                     raise ValueError("站点或航段编号格式无效")
-            if (route.id in labels or not isfinite(route.km) or not .5<=route.km<=4
+            if (route.id in labels or not isfinite(route.km) or not rules.leg_min <= route.km <= rules.leg_max
                     or not all(len(point)==2 and all(isfinite(x) for x in point)
                                for point in (route.pickup,route.dropoff))):
                 raise ValueError("航段重复或几何数据无效")
@@ -118,7 +164,7 @@ class Network:
             raise ValueError("骑手起始坐标无效")
         candidates = tuple({**point, "location": tuple(point["location"])} if "location" in point else point
                            for point in row.get("candidates", ()))
-        result = cls(origin, bounds, tuple(routes), candidates, row.get("diagnostics"), starts)
+        result = cls(origin, bounds, tuple(routes), candidates, row.get("diagnostics"), starts, rules)
         if any(not result.contains(point) for route in routes for point in (route.pickup,route.dropoff)):
             raise ValueError("航段端点位于航网范围之外")
         return result
@@ -149,15 +195,14 @@ def ground_time(km, depart):
 def match_order(network, order):
     if not network.contains(order.pickup) or not network.contains(order.dropoff):
         raise ValueError("取送点须在已载入路网的范围内")
-    if order.kg > 2:
-        return replace(order, route_id=None, eligibility="包裹超过 2 kg")
-    if not .5 <= network.straight(order.pickup, order.dropoff) <= 5:
-        return replace(order, route_id=None, eligibility="取送直线距离不在 0.5 至 5 km")
+    if reason := network.rejection(order):
+        return replace(order, route_id=None, eligibility=reason)
     eligible = []
     for route in network.routes:
-        first = network.road(order.pickup, route.pickup)
-        last = network.road(route.dropoff, order.dropoff)
-        if max(first, last) <= 2.5:
+        if (network.access(order.pickup, route.pickup) <= network.rules.access_km
+                and network.access(route.dropoff, order.dropoff) <= network.rules.access_km):
+            first = network.road(order.pickup, route.pickup)
+            last = network.road(route.dropoff, order.dropoff)
             nominal = minutes(first, 18)+minutes(last, 18)+minutes(route.km, 40)+6
             eligible.append((nominal, route.id))
     if eligible:

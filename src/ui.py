@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import tempfile
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import datetime, time, timedelta, timezone
@@ -18,20 +16,15 @@ import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 
-from .batch import DISTURBANCES, SCENARIOS, Disturbance, digest, load_results, run_batch, summarize_results
-from .data import new_order, prepare, rng, source_counts
-from .demo_data import PUBLIC_COUNT
-from .examples import mechanism_network
-from .model import BUSINESS, MODES, STRATEGIES, Network
+from .batch import DISTURBANCES, SCENARIOS, Disturbance, digest, run_batch, summarize_results
+from .data import new_order, prepare, rng, source_counts, sources, split_sources
+from .model import BUSINESS, MODES, STRATEGIES, FlightRules
 from .storage import encode
-from .workspace import DEMO_SOURCE, SAMPLE_SOURCE, ManualRecord, ManualStore, construct, manual_preview
+from .workspace import ManualRecord, ManualStore, construct, manual_preview
 
 ROOT = Path(__file__).resolve().parents[1]
 CLOUD = os.environ.get("DRONE_DISPATCH_MODE") != "local"
 TITLE = "城市物流无人机航网规划与空地协同调度系统"
-DEMO_LABEL = "公开模拟 CSV"
-# Counts of the fixed public file, shown before the full profile is loaded.
-DEMO_COUNTS = (338_121, 254_546)
 DATA_ERRORS = (ValueError, TypeError, OSError, KeyError, OverflowError, EOFError)
 STYLE = """
 <style>
@@ -52,16 +45,6 @@ STYLE = """
 """
 
 
-@st.cache_resource(show_spinner=False)
-def public_profile():
-    return prepare(ROOT / "data/demo_orders.csv.gz")
-
-
-@st.cache_data(show_spinner=False)
-def public_network():
-    return Network.from_dict(json.loads((ROOT / "data/demo_network.json").read_text(encoding="utf-8")))
-
-
 @st.cache_resource
 def worker_pool():
     return ThreadPoolExecutor(max_workers=2, thread_name_prefix="dispatch")
@@ -79,18 +62,10 @@ def today():
     return datetime.now(timezone(timedelta(hours=8))).date()
 
 
-def read_source(source):
-    s = st.session_state
-    if source == DEMO_SOURCE:
-        return public_profile()
-    if s.profile_key == source and s.profile is not None:
-        return s.profile
-    raise ValueError("请重新导入该航网对应的源 CSV")
-
-
-def activate(network, source, label):
+def activate(network, source, label, operation_profile):
     s = st.session_state
     s.network = network
+    s.operation_profile = operation_profile
     s.network_version = digest(asdict(network))
     s.source = source
     s.source_label = label
@@ -109,73 +84,109 @@ def initialize():
         else:
             directory = Path(os.environ.get("DRONE_DISPATCH_RUNS", ROOT / "runs"))
         s.manual_store = ManualStore(directory / "manual-orders.sqlite3")
-        s.profile = s.profile_key = None
-        s.build_source = DEMO_SOURCE
-        s.build_label = DEMO_LABEL
-        activate(public_network(), DEMO_SOURCE, DEMO_LABEL)
+        s.profile = s.profile_key = s.network = None
+        s.operation_profile = None
+
+
+def planning_settings():
+    with st.expander("建网参数"):
+        first, second, third = st.columns(3)
+        weight = first.number_input("包裹最大重量 kg", min_value=.01, value=2., step=.1)
+        order_min = second.number_input("最短取送直线距离 km", min_value=0., value=1., step=.1)
+        order_max = third.number_input("最长取送直线距离 km", min_value=.01, value=4.04, step=.1)
+        access = first.number_input("每端最大直线接驳距离 km", min_value=.01, value=3., step=.1)
+        leg_min = second.number_input("最短 Hub–接驳站航段 km", min_value=.01, value=.5, step=.1)
+        leg_max = third.number_input("最长 Hub–接驳站航段 km", min_value=.01, value=6.06, step=.1)
+        hubs = first.number_input("Hub 数量目标", min_value=1, value=15, step=1)
+        spokes = second.number_input("接驳站数量目标", min_value=1, value=10, step=1)
+        corridors = third.number_input("可调度航段数量上限（0 为不限）", min_value=0, value=0, step=1)
+        eps = first.number_input("DBSCAN 邻域半径 km（0 为自动）", min_value=0., value=0., step=.05)
+        minimum = second.number_input("DBSCAN 最小样本数（0 为自动）", min_value=0, value=0, step=1)
+        exclude = st.checkbox("拼好饭仅走地面", value=True)
+        st.caption("订单距离与接驳半径按直线计算。CSV 没有重量时，使用按业务类型生成的重量。站点候选来自上传 CSV 的取送点。")
+    rules = dict(weight=weight, order_min=order_min, order_max=order_max, access_km=access,
+                 leg_min=leg_min, leg_max=leg_max, report=True, exclude_group_meal=exclude)
+    settings = dict(max_hubs=hubs, max_spokes=spokes, max_routes=corridors or None,
+                    eps=eps or None, minimum=minimum or None)
+    return rules, settings
 
 
 def data_panel():
     s = st.session_state
     st.subheader("导入与建网")
-    left, right = st.columns([1.65, 1])
-    with left:
-        upload = st.file_uploader("导入运行数据", type=["csv", "gz"], key=f"data_file_{s.get('upload_revision', 0)}")
-        with st.expander("字段映射与编码"):
-            mapping = st.text_area("原始列名到标准列名的 JSON 映射", "{}")
-            encoding = st.selectbox("CSV 编码", ("utf-8-sig", "gb18030"))
-        if upload:
-            token = (upload.file_id, mapping, encoding)
-            if s.get("upload_token") != token:
-                s.upload_token = token
-                s.upload_error = None
+    upload = st.file_uploader("导入运行数据", type=["csv", "gz"], key="data_file")
+    if not upload:
+        s.upload_token = None
+        s.profile = s.profile_key = None
+        if not s.network:
+            st.info("上传 CSV 或 CSV.GZ 后可划分数据并构建航网。")
+        return
+    if s.get("upload_token") != upload.file_id:
+        s.upload_token = upload.file_id
+        s.upload_error = None
+        try:
+            with st.spinner("校验 CSV 并统计有效订单…"):
+                payload = upload.getvalue()
                 try:
-                    mapping_data = json.loads(mapping)
-                    if not isinstance(mapping_data, dict) or not all(isinstance(v, str) for v in mapping_data.values()):
-                        raise ValueError("字段映射必须是列名到列名的 JSON 对象")
-                    with st.spinner("校验订单和准备需求分布…"):
-                        payload = upload.getvalue()
-                        profile = prepare(payload, mapping_data, encoding)
-                        fingerprint = hashlib.sha256(payload).hexdigest()
-                    s.profile, s.profile_key = profile, fingerprint
-                    s.profile_counts = source_counts(profile)
-                    s.build_source, s.build_label = fingerprint, upload.name[:255]
-                except DATA_ERRORS as error:
-                    s.upload_error = f"导入失败 · {error}"
-            if s.get("upload_error"):
-                st.error(s.upload_error)
-        if s.build_source != DEMO_SOURCE and st.button("改用公开模拟 CSV", key="use_demo"):
-            s.build_source, s.build_label = DEMO_SOURCE, DEMO_LABEL
-            s.upload_revision = s.get("upload_revision", 0) + 1
-            st.rerun()
-    with right:
-        if s.build_source == DEMO_SOURCE:
-            total, planning, operation = PUBLIC_COUNT, *DEMO_COUNTS
-        elif s.profile_key == s.build_source and s.profile is not None:
-            pools = s.profile_counts
-            total, planning, operation = s.profile.report["窗口内可用"], pools["planning"], pools["operation"]
+                    profile = prepare(payload)
+                except UnicodeDecodeError:
+                    profile = prepare(payload, encoding="gb18030")
+                fingerprint = hashlib.sha256(payload).hexdigest()
+            s.profile, s.profile_key = profile, fingerprint
+            s.profile_counts = source_counts(profile)
+        except DATA_ERRORS as error:
+            s.upload_error = f"导入失败 · {error}"
+    if s.upload_error:
+        st.error(s.upload_error)
+        return
+    profile = s.profile
+    total = profile.report["窗口内可用"]
+    planning, operation = s.profile_counts["planning"], s.profile_counts["operation"]
+    st.caption(f"{upload.name} · 有效 {total:,}／{profile.report['输入']:,} 条（10:00–20:00，校验并去重后）")
+    manual_split = False
+    if total >= 2:
+        split = st.radio("数据来源划分", ("按日组划分", "手动指定来源数量"), horizontal=True)
+        manual_split = split == "手动指定来源数量"
+    if manual_split:
+        first, second = st.columns(2)
+        planning = first.number_input("规划来源数量", 1, total - 1, min(planning, total - 1),
+                                      key=f"planning_source_{s.profile_key}")
+        operation = second.number_input("运营来源数量", 1, total - 1, min(operation, total - planning),
+                                        key=f"operation_source_{s.profile_key}")
+        valid = planning + operation <= total
+        if valid:
+            st.caption(f"两组按固定种子切分且互不重叠，另有 {total - planning - operation:,} 条不使用。")
         else:
-            total = planning = operation = None
-        if total is None:
-            st.info("已恢复航网。重新导入该工作区的源 CSV 可建网或运行策略对照。")
+            st.error("规划与运营来源数量之和不能超过有效订单数。")
+    else:
+        valid = True
+        groups = sources(profile)
+        if groups["planning"] != groups["operation"]:
+            st.caption(f"规划使用日组 {'、'.join(groups['planning'])}，运营使用日组 {'、'.join(groups['operation'])}。")
         else:
-            st.caption(f"{s.build_label} · 有效 {total:,} 条 · 规划来源 {planning:,} 条 · 运营来源 {operation:,} 条")
-        count = st.number_input("规划订单数", min_value=1, max_value=100_000, value=4_000, step=1)
-        include = st.checkbox("纳入已完成的新单", value=True, key="include_manual")
-        invalid = bool(upload and s.get("upload_error"))
-        if st.button("分析并构建航网", type="primary", disabled=total is None or invalid, width="stretch"):
-            try:
-                with st.spinner(f"正在分析 {count:,} 条规划订单、选站和构建航段…"):
-                    profile = read_source(s.build_source)
-                    network = construct(profile, s.manual_store.list(), s.build_source, count, include)
-                activate(network, s.build_source, s.build_label)
-                st.success(f"已启用新航网 · {len(network.routes)} 条航段 · 纳入 {network.diagnostics['returned_orders']} 条已完成新单")
-            except DATA_ERRORS as error:
-                st.error(f"建网失败 · {error}")
-        if st.button("载入电池扰动样例", key="load_sample"):
-            activate(mechanism_network(), SAMPLE_SOURCE, "电池扰动样例")
-            s.disturbance = Disturbance("battery", "H01", 50, 720, 780)
-            st.rerun()
+            st.caption("可用日组不足 7 个，按日组模式下规划与运营共用来源。")
+    st.caption(f"规划来源 {planning:,} 条 · 运营来源 {operation:,} 条")
+    use_all = st.checkbox("使用全部规划来源")
+    count = None if use_all else st.number_input("规划订单数", min_value=1, value=min(4_000, planning),
+                                                key=f"planning_count_{s.profile_key}_{planning}")
+    if count is not None and count > planning:
+        st.error("规划订单数不能超过规划来源数量。")
+        valid = False
+    include = st.checkbox("纳入已完成的新单", value=True, key="include_manual")
+    if use_all and include:
+        st.caption("使用全部规划来源时，符合条件的已完成新单在来源订单之外另计。")
+    rules, settings = planning_settings()
+    if st.button("分析并构建航网", type="primary", disabled=not valid):
+        try:
+            with st.spinner(f"正在分析 {planning if count is None else count:,} 条规划订单并构建航网…"):
+                plan_pool, operation_pool = split_sources(profile, planning, operation) if manual_split else (profile, profile)
+                network = construct(plan_pool, s.manual_store.list(), s.profile_key, count, include,
+                                    no_replacement=True, rules=FlightRules(**rules), **settings)
+            activate(network, s.profile_key, upload.name[:255], operation_pool)
+            returned = network.diagnostics["returned_orders"]
+            st.success(f"已启用新航网 · {len(network.routes)} 条可调度航段 · 纳入 {returned} 条已完成新单")
+        except DATA_ERRORS as error:
+            st.error(f"建网失败 · {error}")
 
 
 def station_labels(network):
@@ -241,14 +252,20 @@ def map_panel(defaults):
     network = s.network
     st.subheader("航网地图")
     diag = network.diagnostics or {}
-    stats = f"{len(network.routes)} 条航段 · {s.source_label}"
+    corridors = diag.get("hub_corridors", [])
+    hubs = len({site["id"] for site in network.candidates if site["active"] and site["role"] == "Hub"}
+               | {route.hub for route in network.routes})
+    spokes = len({route.spoke for route in network.routes})
+    stats = f"{hubs} 个 Hub · {spokes} 个接驳站 · {len(network.routes)} 条可调度航段 · {s.source_label}"
     if "planning" in diag:
-        stats += f" · {diag['planning']:,} 单规划"
+        stats += f" · {diag['planning']:,} 单规划 · {diag['potential']:,} 单通过初筛 · {diag['covered']:,} 单覆盖"
     st.caption(stats)
     if not network.routes:
         st.info("规划订单未形成满足载重、航程与两端接驳条件的航段，地面配送仍可计算。")
-    if s.source == SAMPLE_SOURCE:
-        st.caption("电池样例含三笔背景订单。默认新单为 12:00，备用电池由 6 块限为 3 块。")
+    if corridors:
+        st.caption(f"紫色虚线为 {len(corridors)} 条 Hub 间规划走廊。单笔配送使用青色可调度航段。")
+    if not network.routes and diag.get("screened_out"):
+        st.caption("初筛排除 · " + "；".join(f"{reason}：{count:,} 单" for reason, count in diag["screened_out"].items()))
     target = st.radio("地图点击设置", ("取货点", "目的地"), horizontal=True)
     prefix = f"point_{s.map_revision}_"
     d = s.disturbance
@@ -258,6 +275,9 @@ def map_panel(defaults):
     layers = folium.FeatureGroup(name="航网与新单")
     is_resource = d and d.kind != "demand"
     sites = {}
+    for corridor in corridors:
+        folium.PolyLine([corridor["start"], corridor["end"]], color="#725296", weight=2, dash_array="5 6",
+                        tooltip=f"{corridor['id']} · Hub 间规划走廊 · {corridor['km']:.2f} km").add_to(layers)
     for route in network.routes:
         endpoints = {route.hub_site or route.hub, route.spoke_site or route.spoke}
         affected = is_resource and (d.site in endpoints if d.kind == "pad" else d.site == route.hub)
@@ -266,6 +286,9 @@ def map_panel(defaults):
                         tooltip=f"{route.id} · {route.km:.2f} km" + (" · 运力受限" if affected else "")).add_to(layers)
         sites[route.hub] = (route.pickup, "Hub", is_resource and (d.site in (route.hub_site, route.hub)))
         sites[route.spoke] = (route.dropoff, "接驳站", is_resource and d.site in (route.spoke_site, route.spoke))
+    for site in network.candidates:
+        if site["active"] and site["role"] == "Hub":
+            sites.setdefault(site["id"], (site["location"], "Hub", False))
     for name, (point, role, affected) in sites.items():
         folium.CircleMarker(point, radius=8 if role == "Hub" else 6,
                             color="#c46a27" if affected else "#163555" if role == "Hub" else "#0e766e",
@@ -348,15 +371,12 @@ def order_panel(defaults):
                           disabled=bool(same and draft["confirmed"]))
     if requested or (same and not draft["confirmed"] and draft["disturbance"] != s.disturbance):
         try:
-            sample = s.source == SAMPLE_SOURCE
             order_id = draft["order"].id if same else "M-" + uuid4().hex
             order = new_order(order_id, clock(when), *coords, business, rng(int(signature[:8], 16), 6), source="manual")
-            if sample:
-                order = replace(order, ready=order.arrival, deadline=order.arrival + 26, kg=1.)
             if weight:
                 order = replace(order, kg=weight)
-            normal = manual_preview(s.network, order, sample=sample)
-            result = manual_preview(s.network, order, s.disturbance, sample=sample) if s.disturbance else normal
+            normal = manual_preview(s.network, order)
+            result = manual_preview(s.network, order, s.disturbance) if s.disturbance else normal
             s.draft = draft = dict(signature=signature, order=order, ordered_at=ordered_at,
                                    normal=normal, result=result, disturbance=s.disturbance,
                                    confirmed=bool(same and draft["confirmed"]))
@@ -430,33 +450,6 @@ def manual_history():
             st.caption("确认配送方式后，可以在这里登记实际送达。")
 
 
-def backup_panel():
-    s = st.session_state
-    with st.expander("工作区备份与恢复"):
-        try:
-            package = s.manual_store.export(s.network, s.source, s.source_label)
-            st.download_button("下载工作区 ZIP", package, "dispatch-workspace.zip", "application/zip",
-                               on_click="ignore")
-        except DATA_ERRORS as error:
-            st.error(str(error))
-        backup = st.file_uploader("选择工作区 ZIP", type=["zip"], key="workspace_backup")
-        if backup and st.button("恢复工作区"):
-            try:
-                network, source, label = s.manual_store.restore(backup.getvalue())
-                activate(network, source, label)
-                if source != SAMPLE_SOURCE:
-                    s.build_source, s.build_label = source, label
-                    s.upload_revision = s.get("upload_revision", 0) + 1
-                else:
-                    s.disturbance = Disturbance("battery", "H01", 50, 720, 780)
-                s.restore_notice = "已恢复航网和手工订单。"
-                st.rerun()
-            except (*DATA_ERRORS, zipfile.BadZipFile) as error:
-                st.error(f"恢复失败 · {error}")
-        if notice := s.pop("restore_notice", None):
-            st.success(notice)
-
-
 def show_comparison(rows, suffix):
     if not rows:
         return
@@ -479,11 +472,6 @@ def show_comparison(rows, suffix):
             item[f"{title}较纯地面"] = f"{delta:+.1f} pp" if delta is not None else "无配对样本"
         table.append(item)
     st.dataframe(table, hide_index=True, width="stretch")
-    if any(row.get("input_sha256") for row in rows):
-        with st.expander("查看共同输入哈希"):
-            st.dataframe([{"模拟日种子": row["seed"], "场景": SCENARIOS[row["scenario"]],
-                           "策略": STRATEGIES[row["strategy"]], "输入哈希": row["input_sha256"]}
-                          for row in rows], hide_index=True, width="stretch")
     flat = [{k: v for k, v in row.items() if not isinstance(v, dict)} for row in rows]
     first, second = st.columns(2)
     first.download_button("下载对照 CSV", pd.DataFrame(flat).to_csv(index=False).encode("utf-8-sig"),
@@ -499,12 +487,10 @@ def batch_panel():
     busy = bool(job and not job["future"].done())
     count_col, action = st.columns([1, 1.45], vertical_alignment="bottom")
     count = count_col.number_input("运营订单数／模拟日", 1, 500, 201, step=1)
-    ready = (s.source == DEMO_SOURCE or (s.source != SAMPLE_SOURCE and s.profile_key == s.source
-                                       and s.profile is not None))
+    ready = s.operation_profile is not None
     if action.button("运行策略对照", type="primary", width="stretch", disabled=busy or not ready):
         try:
-            with st.spinner("读取运营需求分布…"):
-                profile = read_source(s.source)
+            profile = s.operation_profile
             queues, cancelled = SimpleQueue(), Event()
             network, disturbance = s.network, s.disturbance
             future = worker_pool().submit(run_batch, profile, network, (201,), ("normal",),
@@ -515,10 +501,6 @@ def batch_panel():
             st.rerun()
         except DATA_ERRORS as error:
             st.error(f"无法启动策略对照 · {error}")
-    if not ready:
-        st.caption("重新导入航网对应的源 CSV 可运行对照。" if s.source != SAMPLE_SOURCE else
-                   "电池样例用于单笔演示。重新建网后可运行运营对照。")
-
     if job:
         @st.fragment(run_every=1.0 if busy else None)
         def progress_panel():
@@ -550,27 +532,6 @@ def batch_panel():
                 job["cancelled"].set()
         progress_panel()
 
-    with st.expander("导入多日对照结果"):
-        upload = st.file_uploader("选择命令行生成的 batch.json 或 batch.csv", type=["json", "csv"],
-                                  key="batch_file")
-        if upload and st.button("读取对照结果"):
-            try:
-                rows = load_results(upload.getvalue(), upload.name.lower().endswith(".csv"))
-                s.imported_batch = (upload.name, rows)
-            except DATA_ERRORS as error:
-                st.error(f"读取对照结果失败 · {error}")
-        if s.get("imported_batch"):
-            name, rows = s.imported_batch
-            st.caption(f"{name} · {len(rows)} 条策略记录")
-            complete = {}
-            for row in rows:
-                group = (row["network_sha256"], row["scenario"], row["seed"], row["input_sha256"])
-                complete.setdefault(group, set()).add(row["strategy"])
-            missing = sum(len(group) < len(STRATEGIES) for group in complete.values())
-            if missing:
-                st.caption(f"{missing} 个配对组的策略尚未全部完成。")
-            show_comparison(rows, "imported")
-
 
 def main():
     st.set_page_config(page_title=TITLE, layout="wide", page_icon="✈️")
@@ -580,10 +541,11 @@ def main():
                 '<div class="app-subtitle">Drone Delivery Network and Air–Ground Dispatch</div>',
                 unsafe_allow_html=True)
     data_panel()
-    disturbance_panel()
-
     s = st.session_state
     network = s.network
+    if network is None:
+        return
+    disturbance_panel()
     defaults = ((network.routes[0].pickup, network.routes[0].dropoff) if network.routes
                 else (network.origin, network.origin))
     st.divider()
@@ -595,4 +557,3 @@ def main():
     manual_history()
     st.divider()
     batch_panel()
-    backup_panel()

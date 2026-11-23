@@ -1,6 +1,6 @@
 import gzip
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -14,6 +14,7 @@ class Profile:
     rows: pd.DataFrame
     origin: tuple[float, float]
     report: dict
+    single_pool: bool = False
 
 
 def _minute(values):
@@ -60,17 +61,23 @@ def prepare(source, mapping=None, encoding="utf-8-sig"):
             if check.duplicated(["group", "order_seq_id"]).any():
                 raise ValueError("同一日组和订单编号存在内容冲突")
             duplicated.loc[has_id] = rows.duplicated(["group", "order_seq_id"]).to_numpy()
+    df["reference_minutes"] = np.nan
+    df["weight_kg"] = pd.to_numeric(df.get("weight_kg", pd.Series(np.nan, index=df.index)), errors="coerce").astype(float)
+    if (df.weight_kg.notna() & (~np.isfinite(df.weight_kg) | (df.weight_kg <= 0))).any():
+        raise ValueError("weight_kg 须为正数")
     reference_late = reference_invalid = 0
     if {"fetch_time","arrived_time"}.issubset(df):
         f, a = _minute(df.fetch_time), _minute(df.arrived_time)
         pre, drive = (f-df.minute)%1440, (a-f)%1440
+        df["reference_minutes"] = drive.where((pre + drive) <= 180).astype(float)
         reference_late = int((valid & ((pre + drive)>180)).sum())
         reference_invalid = int((valid & (f.isna() | a.isna())).sum())
     active = valid & ~duplicated & df.minute.between(START, LAST_ARRIVAL-1)
     if not active.any():
         raise ValueError("10:00 至 20:00 内没有可用订单")
-    rows = df.loc[active, ["group", *KEYS]].groupby(
-        ["group", *KEYS], sort=True, dropna=False, observed=True
+    grouping = ["group", *KEYS, "reference_minutes", "weight_kg"]
+    rows = df.loc[active, grouping].groupby(
+        grouping, sort=True, dropna=False, observed=True
     ).size().rename("count").reset_index()
     lat = pd.concat([rows.pickup_latitude, rows.dropoff_latitude])
     lon = pd.concat([rows.pickup_longitude, rows.dropoff_longitude])
@@ -98,7 +105,7 @@ def new_order(id, minute, pickup, dropoff, business, random, price=None, source=
 
 def sources(profile):
     groups = sorted(profile.rows.group.unique())
-    if len(groups) >= 7:
+    if len(groups) >= 7 and not profile.single_pool:
         return {"planning": groups[:4], "operation": groups[4:7]}
     return {"planning": groups, "operation": groups}
 
@@ -109,8 +116,34 @@ def source_counts(profile):
             for key, groups in pools.items()}
 
 
+def split_sources(profile, planning, operation):
+    total = int(profile.rows["count"].sum())
+    if not (planning >= 1 and operation >= 1 and planning + operation <= total):
+        raise ValueError("规划与运营来源都需要至少一单，合计不能超过有效订单数")
+    counts = profile.rows["count"].to_numpy(dtype=np.int64)
+    positions = rng(101, 22).permutation(np.repeat(np.arange(len(counts)), counts))
+
+    def pool(indices):
+        frequencies = np.bincount(indices, minlength=len(counts))
+        selected = frequencies > 0
+        return replace(profile, rows=profile.rows.loc[selected].assign(count=frequencies[selected]), single_pool=True)
+
+    return pool(positions[:planning]), pool(positions[planning:planning + operation])
+
+
+def planning_sample(profile, count=None, seed=101):
+    rows = profile.rows[profile.rows.group.isin(sources(profile)["planning"])]
+    positions = np.repeat(np.arange(len(rows)), rows["count"].to_numpy(dtype=np.int64))
+    if count is not None:
+        if not 0 <= count <= len(positions):
+            raise ValueError("规划订单数超过来源数量或小于零")
+        if count < len(positions):
+            positions = rng(seed, 0).choice(positions, size=count, replace=False)
+    return materialize(rows.iloc[positions], seed, "P", 1)
+
+
 def generate(profile, count, seed, purpose="operation", window=None, prefix=None):
-    if not 0 <= count <= 100000 or seed < 0:
+    if count < 0 or (purpose != "planning" and count > 100_000) or seed < 0:
         raise ValueError("订单数量或种子超出允许范围")
     pools = sources(profile)
     split = pools["planning"] != pools["operation"]
@@ -136,8 +169,18 @@ def sample(rows, count, seed, prefix, stream=0):
         raise ValueError("所选时窗没有可以抽样的记录")
     weights = rows["count"].to_numpy(dtype=float)
     positions = rng(seed, stream).choice(len(rows), size=count, p=weights/weights.sum())
-    random = rng(seed, stream+1)
-    return [new_order(f"{prefix}-{seed}-{i+1:05}", int(r.minute),
+    return materialize(rows.iloc[positions], seed, prefix, stream + 1)
+
+
+def materialize(rows, seed, prefix, stream):
+    random = rng(seed, stream)
+    orders = []
+    for i, r in enumerate(rows.itertuples(index=False)):
+        order = new_order(f"{prefix}-{seed}-{i+1:05}", int(r.minute),
                       (r.pickup_latitude,r.pickup_longitude), (r.dropoff_latitude,r.dropoff_longitude),
                       r.biz_line, random, None if pd.isna(r.package_price) else float(r.package_price))
-            for i,r in enumerate(rows.iloc[positions].itertuples(index=False))]
+        reference = getattr(r, "reference_minutes", np.nan)
+        weight = getattr(r, "weight_kg", np.nan)
+        orders.append(replace(order, kg=order.kg if pd.isna(weight) else float(weight),
+                              reference_minutes=None if pd.isna(reference) else float(reference)))
+    return orders

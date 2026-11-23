@@ -4,14 +4,15 @@ import json
 import re
 import sqlite3
 import zipfile
+from hashlib import sha256
 from contextlib import closing
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from math import ceil, floor, isfinite
 
-from .batch import digest, resolve_restriction
+from .batch import resolve_restriction
 from .cli import profile_extent
-from .data import generate
+from .data import generate, planning_sample
 from .examples import battery_pair
 from .model import BUSINESS, END, LAST_ARRIVAL, MODES, START, Network, Order
 from .network import build
@@ -149,9 +150,9 @@ class ManualStore:
         return network, source, label
 
 
-def planning_orders(profile, records, source, count, include_manual=True):
-    if not 1 <= count <= 100_000:
-        raise ValueError("规划订单数须为 1 至 100,000")
+def planning_orders(profile, records, source, count, include_manual=True, *, no_replacement=False):
+    if count is not None and count < 1:
+        raise ValueError("规划订单数须为正整数")
     low, high = profile_extent(profile)
     base = Network(profile.origin, (0, 0, 0, 0), ())
     (left, bottom), (right, top) = base.xy(low), base.xy(high)
@@ -162,16 +163,25 @@ def planning_orders(profile, records, source, count, include_manual=True):
                 and area.contains(row.order.pickup) and area.contains(row.order.dropoff))
     history = (sorted(eligible, key=lambda row: (row.delivered_at, row.order.id), reverse=True)[:count]
                if include_manual else [])
-    orders = generate(profile, count - len(history), 101, "planning")
+    if count is None:
+        orders = planning_sample(profile)
+    elif no_replacement:
+        orders = planning_sample(profile, count - len(history))
+    else:
+        orders = generate(profile, count - len(history), 101, "planning")
     orders.extend(replace(row.order, route_id=None, eligibility="未匹配") for row in history)
     return orders, len(history)
 
 
-def construct(profile, records, source, count, include_manual=True):
-    orders, returned = planning_orders(profile, records, source, count, include_manual)
-    network = build(orders, profile.origin, extent=profile_extent(profile))
+def construct(profile, records, source, count, include_manual=True, *, no_replacement=False, **settings):
+    orders, returned = planning_orders(profile, records, source, count, include_manual,
+                                       no_replacement=no_replacement)
+    network = build(orders, profile.origin, extent=profile_extent(profile), **settings)
+    checksum = sha256()
+    for order in orders:
+        checksum.update((encode(order.__dict__) + "\n").encode("utf-8"))
     diagnostics = {**network.diagnostics, "returned_orders": returned,
-                   "planning_input_sha256": digest([asdict(order) for order in orders])}
+                   "planning_input_sha256": checksum.hexdigest()}
     return replace(network, diagnostics=diagnostics)
 
 

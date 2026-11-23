@@ -1,4 +1,7 @@
 import json
+from io import BytesIO
+
+import streamlit as st
 from dataclasses import asdict, replace
 from datetime import time
 from pathlib import Path
@@ -8,11 +11,11 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from src.batch import Disturbance, digest, load_results, run_batch, summarize_results, write_results
-from src.data import prepare, source_counts
+from src.data import planning_sample, prepare, source_counts, split_sources
 from src.demo_data import synthetic_csv
 from src.examples import mechanism_network
-from src.model import STRATEGIES, Order
-from src.workspace import DEMO_SOURCE, SAMPLE_SOURCE, ManualRecord, ManualStore, construct, manual_preview
+from src.model import STRATEGIES, Network, Order
+from src.workspace import DEMO_SOURCE, ManualRecord, ManualStore, construct, manual_preview
 
 
 @pytest.fixture(scope="module")
@@ -107,22 +110,51 @@ def test_foreign_profile_build_switches_the_manual_coordinates():
         manual_preview(net, manual_order())
 
 
-def test_single_page_manual_delivery():
+def test_manual_source_split_uses_each_input_record_at_most_once():
+    payload = (b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,weight_kg\n"
+               + b"35.68,139.75,35.69,139.77,12:00,0.7\n" * 10
+               + b"35.68,139.75,35.69,139.77,12:30,2.2\n" * 8)
+    plan, operation = split_sources(prepare(payload), 12, 6)
+    planned, operated = planning_sample(plan), planning_sample(operation)
+    assert (len(planned), len(operated)) == (12, 6)
+    assert sum(order.kg == .7 for order in planned + operated) == 10
+    assert len(planning_sample(plan, 3)) == 3
+
+
+def test_single_page_manual_delivery(monkeypatch):
     entrypoint = Path(__file__).resolve().parents[1] / "streamlit_app.py"
     app = AppTest.from_file(entrypoint, default_timeout=20).run()
     assert not app.exception
+    assert not app.button
+    assert app.session_state.network is None
+
+    upload = BytesIO(b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,weight_kg\n"
+                     + b"35.68,139.75,35.69,139.77,12:00,1.1\n" * 6)
+    upload.file_id, upload.name = "test-file", "test.csv"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload)
+    app.run()
+    assert not app.exception
+    assert not {"字段映射与编码", "工作区备份与恢复", "导入多日对照结果", "查看共同输入哈希"} & {
+        expander.label for expander in app.expander
+    }
+    next(box for box in app.checkbox if box.label == "使用全部规划来源").check().run()
+    next(widget for widget in app.number_input if widget.label == "包裹最大重量 kg").set_value(1.05).run()
+    next(widget for widget in app.button if widget.label == "分析并构建航网").click().run()
+    assert not app.exception
+    net = app.session_state.network
+    assert net.diagnostics["planning"] == 6
+    assert net.diagnostics["potential"] == 0
+    assert net.rules.weight == 1.05 and Network.from_dict(asdict(net)) == net
     assert any(heading.value == "运营策略对照" for heading in app.subheader)
-    app.button(key="load_sample").click().run()
 
     def button(label):
         return next(widget for widget in app.button if widget.label == label)
 
     button("计算配送建议").click().run()
     assert not app.exception
-    assert app.session_state.draft["normal"]["mode"] == "air"
     assert app.session_state.draft["result"]["mode"] == "ground"
     button("确认送单方式").click().run()
-    assert app.session_state.manual_store.list()[0].source == SAMPLE_SOURCE
+    assert app.session_state.manual_store.list()[0].source == app.session_state.profile_key
     assert button("登记实际送达").disabled
     next(widget for widget in app.time_input if widget.label == "实际送达时间").set_value(time(12, 28)).run()
     button("登记实际送达").click().run()
