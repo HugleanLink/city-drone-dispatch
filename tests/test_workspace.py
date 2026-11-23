@@ -121,6 +121,32 @@ def test_manual_source_split_uses_each_input_record_at_most_once():
     assert len(planning_sample(plan, 3)) == 3
 
 
+def test_planning_day_change_updates_operation_range_and_builds_from_selected_days(monkeypatch):
+    entrypoint = Path(__file__).resolve().parents[1] / "streamlit_app.py"
+    header = b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,dt_seq_id\n"
+    rows = "".join(f"35.68,139.75,35.69,139.77,12:00,{day}\n" for day in range(1, 8))
+    upload = BytesIO(header + rows.encode())
+    upload.file_id, upload.name = "days", "days.csv"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload)
+    app = AppTest.from_file(entrypoint, default_timeout=20).run()
+
+    def number(label):
+        return next(widget for widget in app.number_input if widget.label == label)
+
+    assert number("规划航网使用结束日").value == 4
+    assert number("模拟运营使用起始日").value == 5
+    number("规划航网使用结束日").set_value(3).run()
+    assert number("模拟运营使用起始日").value == 4
+    assert number("模拟运营使用结束日").value == 7
+    number("Hub 数量上限（0 为不限）").set_value(0).run()
+    number("接驳站数量上限（0 为不限）").set_value(0).run()
+    next(widget for widget in app.button if widget.label == "分析并构建航网").click().run()
+    assert not app.exception
+    assert app.session_state.network.diagnostics["planning"] == 3
+    assert app.session_state.network.routes
+    assert set(app.session_state.operation_profile.rows.group) == {"4", "5", "6", "7"}
+
+
 def test_single_page_manual_delivery(monkeypatch):
     entrypoint = Path(__file__).resolve().parents[1] / "streamlit_app.py"
     app = AppTest.from_file(entrypoint, default_timeout=20).run()

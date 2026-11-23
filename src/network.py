@@ -80,10 +80,12 @@ def build(orders, origin=None, *, max_hubs=3, max_spokes=4, max_routes=6, extent
     if not potential:
         return replace(base, diagnostics=stats)
     hubs, origins, pickup_eps, pickup_min = _points(
-        base, [o.pickup for o in potential], "H", max(38 if rules.report else 20, max_hubs), eps, minimum)
+        base, [o.pickup for o in potential], "H", max(38 if rules.report else 20, max_hubs or 0), eps, minimum)
     spokes, destinations, dropoff_eps, dropoff_min = _points(
-        base, [o.dropoff for o in potential], "S", max(23 if rules.report else 20, max_spokes),
+        base, [o.dropoff for o in potential], "S", max(23 if rules.report else 20, max_spokes or 0),
         pickup_eps if rules.report else eps, pickup_min if rules.report else minimum)
+    max_hubs = len(hubs) if max_hubs is None else max_hubs
+    max_spokes = len(spokes) if max_spokes is None else max_spokes
     pairs = {}
     pair_index = np.fromiter((pairs.setdefault((o.pickup, o.dropoff), len(pairs)) for o in potential),
                              dtype=np.intp, count=len(potential))

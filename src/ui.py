@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import datetime, time, timedelta, timezone
@@ -17,7 +18,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 from .batch import DISTURBANCES, SCENARIOS, Disturbance, digest, run_batch, summarize_results
-from .data import new_order, prepare, rng, source_counts, sources, split_sources
+from .data import day_groups, new_order, prepare, profile_for_groups, rng, source_counts, split_sources
 from .model import BUSINESS, MODES, STRATEGIES, FlightRules
 from .storage import encode
 from .workspace import ManualRecord, ManualStore, construct, manual_preview
@@ -29,6 +30,10 @@ DATA_ERRORS = (ValueError, TypeError, OSError, KeyError, OverflowError, EOFError
 STYLE = """
 <style>
 .block-container { max-width: 1510px; padding-top: 2.6rem; padding-bottom: 3rem; }
+.page-banner { display: block; width: 100%; max-height: clamp(140px, 22vw, 310px); object-fit: cover;
+               border-radius: 14px; margin-bottom: 1.1rem; }
+.brand-title { display: flex; align-items: center; gap: .85rem; }
+.brand-title img { width: clamp(38px, 4.5vw, 60px); height: auto; flex-shrink: 0; }
 .app-title { color: #122338; font-weight: 750; font-size: clamp(1.5rem, 3vw, 2.45rem);
              letter-spacing: -.045em; line-height: 1.18; margin-bottom: .4rem; }
 .app-subtitle { color: #52677e; margin-bottom: 1.3rem; font-size: .95rem; }
@@ -97,8 +102,8 @@ def planning_settings():
         access = first.number_input("每端最大直线接驳距离 km", min_value=.01, value=3., step=.1)
         leg_min = second.number_input("最短 Hub–接驳站航段 km", min_value=.01, value=.5, step=.1)
         leg_max = third.number_input("最长 Hub–接驳站航段 km", min_value=.01, value=6.06, step=.1)
-        hubs = first.number_input("Hub 数量目标", min_value=1, value=15, step=1)
-        spokes = second.number_input("接驳站数量目标", min_value=1, value=10, step=1)
+        hubs = first.number_input("Hub 数量上限（0 为不限）", min_value=0, value=15, step=1)
+        spokes = second.number_input("接驳站数量上限（0 为不限）", min_value=0, value=10, step=1)
         corridors = third.number_input("可调度航段数量上限（0 为不限）", min_value=0, value=0, step=1)
         eps = first.number_input("DBSCAN 邻域半径 km（0 为自动）", min_value=0., value=0., step=.05)
         minimum = second.number_input("DBSCAN 最小样本数（0 为自动）", min_value=0, value=0, step=1)
@@ -106,9 +111,37 @@ def planning_settings():
         st.caption("订单距离与接驳半径按直线计算。CSV 没有重量时，使用按业务类型生成的重量。站点候选来自上传 CSV 的取送点。")
     rules = dict(weight=weight, order_min=order_min, order_max=order_max, access_km=access,
                  leg_min=leg_min, leg_max=leg_max, report=True, exclude_group_meal=exclude)
-    settings = dict(max_hubs=hubs, max_spokes=spokes, max_routes=corridors or None,
+    settings = dict(max_hubs=hubs or None, max_spokes=spokes or None, max_routes=corridors or None,
                     eps=eps or None, minimum=minimum or None)
     return rules, settings
+
+
+def day_ranges(group_count, source):
+    start_key, end_key, op_start_key, op_end_key = (f"{source}_{part}" for part in
+                                                   ("plan_start", "plan_end", "op_start", "op_end"))
+    state = st.session_state
+
+    def set_operation_range():
+        if state[end_key] < group_count:
+            state[op_start_key], state[op_end_key] = state[end_key] + 1, group_count
+        elif state[start_key] > 1:
+            state[op_start_key], state[op_end_key] = 1, state[start_key] - 1
+
+    def range_fields(label, first_key, last_key, first, last, on_change=None):
+        title, start, separator, end, unit = st.columns([2, 1, .25, 1, .4], vertical_alignment="center")
+        title.write(label)
+        separator.write("–")
+        unit.write("日")
+        lower = start.number_input(label + "起始日", 1, group_count, first, key=first_key,
+                                   label_visibility="collapsed", on_change=on_change)
+        upper = end.number_input(label + "结束日", 1, group_count, last, key=last_key,
+                                 label_visibility="collapsed", on_change=on_change)
+        return lower, upper
+
+    default_end = max(1, min(4, group_count - 1))
+    plan = range_fields("规划航网使用", start_key, end_key, 1, default_end, set_operation_range)
+    operation = range_fields("模拟运营使用", op_start_key, op_end_key, min(default_end + 1, group_count), group_count)
+    return plan, operation
 
 
 def data_panel():
@@ -142,7 +175,6 @@ def data_panel():
     profile = s.profile
     total = profile.report["窗口内可用"]
     planning, operation = s.profile_counts["planning"], s.profile_counts["operation"]
-    st.caption(f"{upload.name} · 有效 {total:,}／{profile.report['输入']:,} 条（10:00–20:00，校验并去重后）")
     manual_split = False
     if total >= 2:
         split = st.radio("数据来源划分", ("按日组划分", "手动指定来源数量"), horizontal=True)
@@ -155,31 +187,38 @@ def data_panel():
                                         key=f"operation_source_{s.profile_key}")
         valid = planning + operation <= total
         if valid:
-            st.caption(f"两组按固定种子切分且互不重叠，另有 {total - planning - operation:,} 条不使用。")
+            st.caption(f"两组不重叠，有 {total - planning - operation:,} 条不使用")
         else:
             st.error("规划与运营来源数量之和不能超过有效订单数。")
     else:
-        valid = True
-        groups = sources(profile)
-        if groups["planning"] != groups["operation"]:
-            st.caption(f"规划使用日组 {'、'.join(groups['planning'])}，运营使用日组 {'、'.join(groups['operation'])}。")
-        else:
-            st.caption("可用日组不足 7 个，按日组模式下规划与运营共用来源。")
-    st.caption(f"规划来源 {planning:,} 条 · 运营来源 {operation:,} 条")
+        groups = day_groups(profile)
+        (plan_first, plan_last), (op_first, op_last) = day_ranges(len(groups), s.profile_key)
+        valid = plan_first <= plan_last and op_first <= op_last
+        if not valid:
+            st.error("起始日须早于或等于结束日。")
+        elif len(groups) > 1 and not (plan_last < op_first or op_last < plan_first):
+            valid = False
+            st.error("规划和运营的日期范围不能重叠。")
+        plan_days, operation_days = groups[plan_first-1:plan_last], groups[op_first-1:op_last]
+        planning = sum(profile.report["按日组"][day] for day in plan_days)
+        if len(groups) == 1:
+            st.caption("文件只有一个有效日组。可用手动指定来源数量来拆分同日订单。")
     use_all = st.checkbox("使用全部规划来源")
-    count = None if use_all else st.number_input("规划订单数", min_value=1, value=min(4_000, planning),
+    count = None if use_all else st.number_input("规划订单数", min_value=1, value=max(1, min(4_000, planning)),
                                                 key=f"planning_count_{s.profile_key}_{planning}")
-    if count is not None and count > planning:
+    if valid and count is not None and count > planning:
         st.error("规划订单数不能超过规划来源数量。")
         valid = False
     include = st.checkbox("纳入已完成的新单", value=True, key="include_manual")
-    if use_all and include:
-        st.caption("使用全部规划来源时，符合条件的已完成新单在来源订单之外另计。")
     rules, settings = planning_settings()
     if st.button("分析并构建航网", type="primary", disabled=not valid):
         try:
             with st.spinner(f"正在分析 {planning if count is None else count:,} 条规划订单并构建航网…"):
-                plan_pool, operation_pool = split_sources(profile, planning, operation) if manual_split else (profile, profile)
+                if manual_split:
+                    plan_pool, operation_pool = split_sources(profile, planning, operation)
+                else:
+                    plan_pool = profile_for_groups(profile, plan_days)
+                    operation_pool = profile_for_groups(profile, operation_days)
                 network = construct(plan_pool, s.manual_store.list(), s.profile_key, count, include,
                                     no_replacement=True, rules=FlightRules(**rules), **settings)
             activate(network, s.profile_key, upload.name[:255], operation_pool)
@@ -256,14 +295,12 @@ def map_panel(defaults):
     hubs = len({site["id"] for site in network.candidates if site["active"] and site["role"] == "Hub"}
                | {route.hub for route in network.routes})
     spokes = len({route.spoke for route in network.routes})
-    stats = f"{hubs} 个 Hub · {spokes} 个接驳站 · {len(network.routes)} 条可调度航段 · {s.source_label}"
-    if "planning" in diag:
-        stats += f" · {diag['planning']:,} 单规划 · {diag['potential']:,} 单通过初筛 · {diag['covered']:,} 单覆盖"
-    st.caption(stats)
+    st.caption(f"{hubs} 个 Hub、{spokes} 个 Spoke、{len(network.routes)} 条航段")
     if not network.routes:
         st.info("规划订单未形成满足载重、航程与两端接驳条件的航段，地面配送仍可计算。")
-    if corridors:
-        st.caption(f"紫色虚线为 {len(corridors)} 条 Hub 间规划走廊。单笔配送使用青色可调度航段。")
+    show_corridors = bool(corridors) and st.checkbox(
+        "显示 Hub 间规划走廊",
+        help="紫色虚线连接两个 Hub，供规划时查看中转通道。红线连接 Hub 和 Spoke，用于当前订单的空地接驳调度。")
     if not network.routes and diag.get("screened_out"):
         st.caption("初筛排除 · " + "；".join(f"{reason}：{count:,} 单" for reason, count in diag["screened_out"].items()))
     target = st.radio("地图点击设置", ("取货点", "目的地"), horizontal=True)
@@ -275,14 +312,14 @@ def map_panel(defaults):
     layers = folium.FeatureGroup(name="航网与新单")
     is_resource = d and d.kind != "demand"
     sites = {}
-    for corridor in corridors:
+    for corridor in corridors if show_corridors else ():
         folium.PolyLine([corridor["start"], corridor["end"]], color="#725296", weight=2, dash_array="5 6",
                         tooltip=f"{corridor['id']} · Hub 间规划走廊 · {corridor['km']:.2f} km").add_to(layers)
     for route in network.routes:
         endpoints = {route.hub_site or route.hub, route.spoke_site or route.spoke}
         affected = is_resource and (d.site in endpoints if d.kind == "pad" else d.site == route.hub)
-        folium.PolyLine([route.pickup, route.dropoff], color="#c46a27" if affected else "#0e766e",
-                        weight=5, dash_array="8 6" if affected else None,
+        folium.PolyLine([route.pickup, route.dropoff], color="#c7212a",
+                        weight=2, opacity=.85, dash_array="6 4" if affected else None,
                         tooltip=f"{route.id} · {route.km:.2f} km" + (" · 运力受限" if affected else "")).add_to(layers)
         sites[route.hub] = (route.pickup, "Hub", is_resource and (d.site in (route.hub_site, route.hub)))
         sites[route.spoke] = (route.dropoff, "接驳站", is_resource and d.site in (route.spoke_site, route.spoke))
@@ -290,9 +327,16 @@ def map_panel(defaults):
         if site["active"] and site["role"] == "Hub":
             sites.setdefault(site["id"], (site["location"], "Hub", False))
     for name, (point, role, affected) in sites.items():
-        folium.CircleMarker(point, radius=8 if role == "Hub" else 6,
-                            color="#c46a27" if affected else "#163555" if role == "Hub" else "#0e766e",
-                            fill=True, fill_opacity=.9, tooltip=f"{role} {name}" + (" · 受限" if affected else "")).add_to(layers)
+        outline = "#c46a27" if affected else "#394352"
+        tooltip = f"{role} {name}" + (" · 受限" if affected else "")
+        if role == "Hub":
+            marker = folium.CircleMarker(point, radius=7, color=outline, weight=2,
+                                         fill=True, fill_color="#ffdb44", fill_opacity=1, tooltip=tooltip)
+        else:
+            marker = folium.RegularPolygonMarker(point, number_of_sides=3, radius=5, rotation=0,
+                                                  color=outline, weight=1, fill_color="#fff",
+                                                  fill_opacity=1, tooltip=tooltip)
+        marker.add_to(layers)
     for index, (key, label, color) in enumerate((("pickup", "取货点", "blue"), ("dropoff", "目的地", "orange"))):
         point = tuple(s.get(prefix + key + str(i), defaults[index][i]) for i in range(2))
         folium.Marker(point, tooltip=label, icon=folium.Icon(color=color,
@@ -420,7 +464,7 @@ def manual_history():
     records = s.manual_store.list()
     pending = {row.order.id: row for row in records if row.delivered_at is None}
     complete = [row for row in records if row.delivered_at is not None]
-    with st.expander(f"手工订单 · {len(pending)} 单待送达 · {len(complete)} 单已完成", expanded=bool(pending)):
+    with st.expander("手工订单", expanded=bool(pending)):
         if pending:
             order_id = st.selectbox("待送达订单", list(pending), format_func=lambda id:
                                     f"{id[:12]} · {MODES[pending[id].chosen_mode]}")
@@ -533,12 +577,21 @@ def batch_panel():
         progress_panel()
 
 
+@st.cache_data(show_spinner=False)
+def header_images():
+    assets = ROOT / "assets"
+    return tuple(b64encode((assets / name).read_bytes()).decode("ascii") for name in ("banner.jpg", "cauc.png"))
+
+
 def main():
     st.set_page_config(page_title=TITLE, layout="wide", page_icon="✈️")
     st.markdown(STYLE, unsafe_allow_html=True)
     initialize()
-    st.markdown(f'<div class="app-title">{TITLE}</div>'
-                '<div class="app-subtitle">Drone Delivery Network and Air–Ground Dispatch</div>',
+    banner, logo = header_images()
+    st.markdown(f'<img class="page-banner" src="data:image/jpeg;base64,{banner}" alt="项目横幅">'
+                f'<div class="brand-title"><img src="data:image/png;base64,{logo}" alt="中国民航大学">'
+                f'<div><div class="app-title">{TITLE}</div>'
+                '<div class="app-subtitle">Drone Delivery Network and Air–Ground Dispatch</div></div></div>',
                 unsafe_allow_html=True)
     data_panel()
     s = st.session_state

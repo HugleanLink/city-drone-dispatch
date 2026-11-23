@@ -103,8 +103,16 @@ def new_order(id, minute, pickup, dropoff, business, random, price=None, source=
                  price, source=source)
 
 
+def day_groups(profile):
+    return sorted(profile.rows.group.unique(), key=lambda group: (not group.isdecimal(), int(group) if group.isdecimal() else group))
+
+
+def profile_for_groups(profile, groups):
+    return replace(profile, rows=profile.rows.loc[profile.rows.group.isin(groups)], single_pool=True)
+
+
 def sources(profile):
-    groups = sorted(profile.rows.group.unique())
+    groups = day_groups(profile)
     if len(groups) >= 7 and not profile.single_pool:
         return {"planning": groups[:4], "operation": groups[4:7]}
     return {"planning": groups, "operation": groups}
