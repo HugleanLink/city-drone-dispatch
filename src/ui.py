@@ -43,8 +43,11 @@ STYLE = """
             padding: .65rem .9rem; margin: .4rem 0 .65rem; }
 .decision small { color: #4e6379; }
 .decision strong { display: block; font-size: 1.25rem; color: #122338; }
-div[data-testid=stMetric] { background: white; padding: .55rem .7rem; }
-[data-testid=stMetricValue], [data-testid=stMetricValue] > div { font-size: 1.28rem; }
+.eta-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .45rem; }
+.eta-cell { padding: .6rem .48rem; border: 1px solid #d8e1e9; border-radius: .5rem; background: white; }
+.eta-cell span { display: block; font-size: .8rem; color: #52677e; }
+.eta-cell strong { display: block; color: #122338; font-size: clamp(.9rem, 1.8vw, 1.35rem);
+                   font-variant-numeric: tabular-nums; line-height: 1.35; }
 </style>
 """
 
@@ -285,9 +288,9 @@ def result_panel(draft):
     mode = result["mode"]
     st.markdown(f'<div class="decision"><small>推荐方式</small><strong>{MODES[mode]}</strong></div>',
                 unsafe_allow_html=True)
-    for col, label, key in zip(st.columns(3), ("地面直送", "空地接驳", "交付截止"),
-                              ("ground_eta", "air_eta", "deadline")):
-        col.metric(label, hhmm(result[key]), border=True)
+    cards = "".join(f'<div class="eta-cell"><span>{label}</span><strong>{hhmm(result[key])}</strong></div>'
+                    for label, key in (("地面直送", "ground_eta"), ("空地接驳", "air_eta"), ("交付截止", "deadline")))
+    st.markdown(f'<div class="eta-strip">{cards}</div>', unsafe_allow_html=True)
     st.caption(f"地面 · {result['ground_reason']}　｜　空地 · {result['air_reason']}")
     branches = {item["mode"]: item for item in result["branches"]}
     winner = branches.get(mode)
