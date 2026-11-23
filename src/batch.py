@@ -7,9 +7,10 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from math import ceil
 
-from .data import generate
+from .data import clock_window, generate, profile_for_groups, sources
 from .metrics import metrics
-from .model import END, LAST_ARRIVAL, START, STRATEGIES, match_order
+from .efficiency import changes, details, fleet_estimate, operating_settings
+from .model import LAST_ARRIVAL, START, STRATEGIES, match_order
 from .sim import Engine
 from .storage import encode
 
@@ -33,7 +34,7 @@ class Disturbance:
     def __post_init__(self):
         if self.kind not in DISTURBANCES:
             raise ValueError("未知扰动类型")
-        latest = LAST_ARRIVAL if self.kind == "demand" else END + 1
+        latest = self.start + LAST_ARRIVAL
         if not START <= self.start < LAST_ARRIVAL or not self.start < self.end <= latest:
             raise ValueError("请检查扰动起止时间")
         if self.kind == "demand" and (not -100 <= self.percent <= 200 or not self.percent):
@@ -65,7 +66,7 @@ def resolve_restriction(run, disturbance):
 
 
 def adjust_demand(orders, profile, seed, disturbance):
-    eligible = [o for o in orders if disturbance.start <= o.arrival < disturbance.end]
+    eligible = [o for o in orders if clock_window(o.arrival, disturbance.start, disturbance.end)]
     goal = ceil(len(eligible) * (100 + disturbance.percent) / 100)
     if goal < len(eligible):
         removed = {o.id for o in sorted(eligible, key=lambda o: o.id, reverse=True)[:len(eligible) - goal]}
@@ -75,9 +76,9 @@ def adjust_demand(orders, profile, seed, disturbance):
 
 
 def run_batch(profile, network, seeds, scenarios, *, hub=None, settings=None, orders_per_day=None,
-              disturbance=None, cancelled=lambda: False, progress=lambda row: None):
+              disturbance=None, cancelled=lambda: False, progress=lambda row: None, ground_model=None, include_orders=False):
     if orders_per_day is not None and not 1 <= orders_per_day <= 100_000:
-        raise ValueError("每模拟日订单数须为 1 至 100,000")
+        raise ValueError("每轮仿真订单数须为 1 至 100,000")
     output = []
     network_data = asdict(network)
     network_hash = digest(network_data)
@@ -94,7 +95,14 @@ def run_batch(profile, network, seeds, scenarios, *, hub=None, settings=None, or
             if scenario == "riders3":
                 run_settings["riders"] = 3
 
-            prototype = Engine(network, settings=run_settings)
+            if ground_model and settings is None:
+                operation = profile_for_groups(profile, sources(profile)["operation"])
+                defaults = operating_settings(operation, network, count)
+                defaults["aircraft_by_hub"] = fleet_estimate(network, orders)
+                if scenario == "riders3":
+                    defaults.pop("rider_hours")
+                run_settings = {**defaults, **run_settings}
+            prototype = Engine(network, settings=run_settings, ground_model=ground_model)
             selected_hub = hub or min(prototype.hubs, default=None)
             event = None
             applied = disturbance
@@ -118,19 +126,31 @@ def run_batch(profile, network, seeds, scenarios, *, hub=None, settings=None, or
 
             applied_data = asdict(applied) if applied else None
             input_hash = digest({"orders": [asdict(o) for o in orders], "event": event,
-                                 "disturbance": applied_data, "settings": run_settings, "network": network_data})
+                                 "disturbance": applied_data, "settings": run_settings, "network": network_data,
+                                 "calibration": ground_model.version if ground_model else None})
+            baseline = None
             for strategy in STRATEGIES:
                 if cancelled():
                     return output
-                run = Engine(network, orders, strategy, run_settings)
+                run = Engine(network, orders, strategy, run_settings, ground_model=ground_model)
                 if event:
                     run.limit(*event)
-                run.advance(END, cancelled)
+                run.finish(cancelled)
                 if cancelled():
                     return output
                 row = {"seed": seed, "scenario": scenario, "strategy": strategy, "input_sha256": input_hash,
                        "network_sha256": network_hash, "base_orders": count, "disturbance": applied_data,
                        **metrics(run)}
+                trial = details(run)
+                if baseline is None:
+                    baseline = trial
+                row.update(changes(baseline, trial, include_case=strategy != "ground"))
+                row["undelivered"] = row["arrivals"] - row["completed"]
+                row["rider_breakdown"] = trial[2]
+                if include_orders:
+                    row["orders"] = trial[0]
+                row["calibration"] = ground_model.version if ground_model else None
+                row["settings"] = run_settings
                 output.append(row)
                 progress(row)
     return output
@@ -203,7 +223,7 @@ def summarize_results(rows):
 def write_results(rows, path):
     if not rows:
         return
-    fields = [k for k, v in rows[0].items() if not isinstance(v, dict) and k != "disturbance"]
+    fields = [k for k, v in rows[0].items() if not isinstance(v, (dict, list)) and k != "disturbance"]
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()

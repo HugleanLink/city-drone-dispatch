@@ -14,7 +14,7 @@ from .batch import resolve_restriction
 from .cli import profile_extent
 from .data import generate, planning_sample
 from .examples import battery_pair
-from .model import BUSINESS, END, LAST_ARRIVAL, MODES, START, Network, Order
+from .model import BUSINESS, LAST_ARRIVAL, MODES, START, Network, Order
 from .network import build
 from .sim import Engine
 from .storage import MAX_SNAPSHOT, encode
@@ -59,7 +59,7 @@ class ManualRecord:
                 raise ValueError("配送建议无效")
             for key in ("ground_eta", "air_eta"):
                 eta = result[key]
-                if eta is not None and (not isinstance(eta, int) or not order.arrival <= eta <= END):
+                if eta is not None and (not isinstance(eta, int) or not order.arrival <= eta):
                     raise ValueError("预计送达时间无效")
         if self.chosen_mode not in ("ground", "air") or self.result[f"{self.chosen_mode}_eta"] is None:
             raise ValueError("请选择可执行的配送方式")
@@ -185,12 +185,12 @@ def construct(profile, records, source, count, include_manual=True, *, no_replac
     return replace(network, diagnostics=diagnostics)
 
 
-def manual_preview(network, order, disturbance=None, *, sample=False):
-    run = battery_pair(False) if sample else Engine(network)
+def manual_preview(network, order, disturbance=None, *, sample=False, ground_model=None, settings=None):
+    run = battery_pair(False) if sample else Engine(network, ground_model=ground_model, settings=settings)
     if sample:
         # Keep the three background orders, and evaluate the fourth through the user-facing form.
         run.records["N4"]["status"] = "removed"
-    checked = run.validate(order)
+    checked = run.prepare_order(order)
     if disturbance and disturbance.kind != "demand":
         run.limit(*resolve_restriction(run, disturbance))
     run.advance(order.arrival)

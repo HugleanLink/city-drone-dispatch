@@ -31,7 +31,7 @@ def prepare(source, mapping=None, encoding="utf-8-sig"):
                 raise ValueError("压缩 CSV 解压后超过 200 MB")
         source=io.BytesIO(source)
     df = pd.read_csv(source, encoding=encoding, dtype="string").rename(columns=mapping or {})
-    required = ["customer_pay_time", *KEYS[1:5]]
+    required = ["customer_pay_time", "fetch_time", "arrived_time", *KEYS[1:5]]
     if missing := set(required)-set(df):
         raise ValueError("缺少输入列 " + "、".join(sorted(missing)))
     total = len(df)
@@ -65,17 +65,25 @@ def prepare(source, mapping=None, encoding="utf-8-sig"):
     df["weight_kg"] = pd.to_numeric(df.get("weight_kg", pd.Series(np.nan, index=df.index)), errors="coerce").astype(float)
     if (df.weight_kg.notna() & (~np.isfinite(df.weight_kg) | (df.weight_kg <= 0))).any():
         raise ValueError("weight_kg 须为正数")
-    reference_late = reference_invalid = 0
-    if {"fetch_time","arrived_time"}.issubset(df):
-        f, a = _minute(df.fetch_time), _minute(df.arrived_time)
-        pre, drive = (f-df.minute)%1440, (a-f)%1440
-        df["reference_minutes"] = drive.where((pre + drive) <= 180).astype(float)
-        reference_late = int((valid & ((pre + drive)>180)).sum())
-        reference_invalid = int((valid & (f.isna() | a.isna())).sum())
+    f, a = _minute(df.fetch_time), _minute(df.arrived_time)
+    pre, drive = (f-df.minute)%1440, (a-f)%1440
+    # Explicit calendar dates take precedence over inferred midnight rollover.
+    dates = [pd.to_datetime(df[key].str.extract(r"^(\d{4}-\d\d-\d\d)")[0], errors="coerce")
+             for key in ("customer_pay_time", "fetch_time", "arrived_time")]
+    date_pre, date_drive = (dates[1]-dates[0]).dt.days, (dates[2]-dates[1]).dt.days
+    pre = (f-df.minute + date_pre*1440).where(date_pre.notna(), pre)
+    drive = (a-f + date_drive*1440).where(date_drive.notna(), drive)
+    reference = (pre >= 0) & (drive >= 0) & ((pre + drive) <= 180)
+    df["reference_minutes"] = drive.where(reference).astype(float)
+    df["pre_pickup"] = pre.where(reference).astype(float)
+    reference_late = int((valid & ((pre + drive) > 180)).sum())
+    reference_invalid = int((valid & ~reference.fillna(False)).sum())
     active = valid & ~duplicated & df.minute.between(START, LAST_ARRIVAL-1)
     if not active.any():
-        raise ValueError("10:00 至 20:00 内没有可用订单")
-    grouping = ["group", *KEYS, "reference_minutes", "weight_kg"]
+        raise ValueError("没有可用订单")
+    if not (active & df.reference_minutes.gt(0)).any():
+        raise ValueError("缺少可用的取货与送达耗时")
+    grouping = ["group", *KEYS, "reference_minutes", "pre_pickup", "weight_kg"]
     rows = df.loc[active, grouping].groupby(
         grouping, sort=True, dropna=False, observed=True
     ).size().rename("count").reset_index()
@@ -150,6 +158,12 @@ def planning_sample(profile, count=None, seed=101):
     return materialize(rows.iloc[positions], seed, "P", 1)
 
 
+def clock_window(minutes, start, end):
+    if end > 1440:
+        return (minutes >= start) | (minutes < end - 1440)
+    return (minutes >= start) & (minutes < end)
+
+
 def generate(profile, count, seed, purpose="operation", window=None, prefix=None):
     if count < 0 or (purpose != "planning" and count > 100_000) or seed < 0:
         raise ValueError("订单数量或种子超出允许范围")
@@ -164,7 +178,7 @@ def generate(profile, count, seed, purpose="operation", window=None, prefix=None
         return orders
     rows = profile.rows[profile.rows.group.isin(pools["operation"])] if split else profile.rows
     if window:
-        rows = rows[rows.minute.ge(window[0]) & rows.minute.lt(window[1])]
+        rows = rows[clock_window(rows.minute, *window)]
     if purpose == "heavy" and count >= 201 and not window:
         return sample(rows,201,seed,"O")+sample(rows,count-201,seed,"X",4)
     return sample(rows, count, seed, prefix or ("P" if purpose == "planning" else "O"))

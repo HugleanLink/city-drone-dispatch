@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from .data import KEYS, Profile, generate, prepare
+from .calibration import fit
+from .data import KEYS, Profile, generate, prepare, profile_for_groups, sources
 from .model import Network, Order
 from .network import build, covered_rows
 from .batch import SCENARIOS, run_batch, write_results
@@ -49,7 +50,8 @@ def main():
     bat=sub.add_parser("batch")
     bat.add_argument("--profile",required=True,type=Path); bat.add_argument("--network",required=True,type=Path)
     bat.add_argument("--seeds",default="201:230"); bat.add_argument("--scenarios",nargs="+",choices=SCENARIOS,default=list(SCENARIOS))
-    bat.add_argument("--orders-per-day", type=int, help="覆盖每个场景的默认运营订单数")
+    bat.add_argument("--orders", "--orders-per-day", dest="orders_per_day", type=int,
+                     help="覆盖每轮仿真的默认订单数")
     bat.add_argument("--out",required=True,type=Path)
     serve=sub.add_parser("serve"); serve.add_argument("--port",default=8501,type=int); serve.add_argument("--workspace",type=Path)
     args=parser.parse_args()
@@ -84,7 +86,11 @@ def main():
         network=Network.from_dict(read(args.network))
         seed=args.seeds.split(":")
         seeds=range(int(seed[0]),int(seed[-1])+1)
+        if not {"pre_pickup", "reference_minutes"} <= set(profile.rows):
+            parser.error("请先重新运行 prepare-data 以生成地面耗时校准字段")
+        ground_model = fit(profile_for_groups(profile, sources(profile)["planning"]))
         rows = run_batch(profile, network, seeds, args.scenarios, orders_per_day=args.orders_per_day,
+                         ground_model=ground_model,
                          progress=lambda row: print(row["scenario"], row["seed"], row["strategy"], flush=True))
         save(args.out/"batch.json",rows)
         write_results(rows,args.out/"batch.csv")

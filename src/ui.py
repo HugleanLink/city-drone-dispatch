@@ -17,8 +17,10 @@ import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 
-from .batch import DISTURBANCES, SCENARIOS, Disturbance, digest, run_batch, summarize_results
-from .data import day_groups, new_order, prepare, profile_for_groups, rng, source_counts, split_sources
+from .batch import DISTURBANCES, Disturbance, adjust_demand, digest, run_batch
+from .calibration import fit
+from .efficiency import fleet_estimate, operating_settings
+from .data import day_groups, generate, new_order, prepare, profile_for_groups, rng, source_counts, split_sources
 from .model import BUSINESS, MODES, STRATEGIES, FlightRules
 from .storage import encode
 from .workspace import ManualRecord, ManualStore, construct, manual_preview
@@ -59,17 +61,22 @@ def clock(value):
 
 
 def hhmm(value):
-    return "不可用" if value is None else f"{value // 60:02}:{value % 60:02}"
+    if value is None:
+        return "不可用"
+    day, minute = divmod(value, 1440)
+    prefix = "次日 " if day == 1 else f"第 {day+1} 日 " if day else ""
+    return f"{prefix}{minute // 60:02}:{minute % 60:02}"
 
 
 def today():
     return datetime.now(timezone(timedelta(hours=8))).date()
 
 
-def activate(network, source, label, operation_profile):
+def activate(network, source, label, operation_profile, ground_model):
     s = st.session_state
     s.network = network
     s.operation_profile = operation_profile
+    s.ground_model = ground_model
     s.network_version = digest(asdict(network))
     s.source = source
     s.source_label = label
@@ -216,9 +223,10 @@ def data_panel(rules, settings):
                 else:
                     plan_pool = profile_for_groups(profile, plan_days)
                     operation_pool = profile_for_groups(profile, operation_days)
+                ground_model = fit(plan_pool)
                 network = construct(plan_pool, s.manual_store.list(), s.profile_key, count, include,
                                     no_replacement=True, rules=FlightRules(**rules), **settings)
-            activate(network, s.profile_key, upload.name[:255], operation_pool)
+            activate(network, s.profile_key, upload.name[:255], operation_pool, ground_model)
             returned = network.diagnostics["returned_orders"]
             st.success(f"已启用新航网 · {len(network.routes)} 条可调度航段 · 纳入 {returned} 条已完成新单")
         except DATA_ERRORS as error:
@@ -264,12 +272,15 @@ def disturbance_panel():
                     percent = st.number_input("订单量变化 (%)" if kind == "demand" else "停用比例 (%)",
                                               *limits, same.percent if same else 50, step=1)
                     start_time = time(same.start // 60, same.start % 60) if same else time(12)
-                    last = min(same.end, 1320) if same else 740
+                    last = same.end % 1440 if same else 740
                     start = st.time_input("开始时间", start_time, step=60)
                     end = st.time_input("结束时间", time(last // 60, last % 60), step=60)
                     if st.form_submit_button("应用扰动", type="primary", width="stretch"):
                         try:
-                            s.disturbance = Disturbance(kind, site, percent, clock(start), clock(end))
+                            begin, finish = clock(start), clock(end)
+                            if finish < begin:
+                                finish += 1440
+                            s.disturbance = Disturbance(kind, site, percent, begin, finish)
                         except ValueError as error:
                             st.error(str(error))
         if s.disturbance:
@@ -353,24 +364,18 @@ def result_panel(draft):
     st.markdown(f'<div class="decision"><small>推荐方式</small><strong>{MODES[mode]}</strong></div>',
                 unsafe_allow_html=True)
     cards = "".join(f'<div class="eta-cell"><span>{label}</span><strong>{hhmm(result[key])}</strong></div>'
-                    for label, key in (("地面直送", "ground_eta"), ("空地接驳", "air_eta"), ("交付截止", "deadline")))
+                    for label, key in (("地面直送", "ground_eta"), ("空地接驳", "air_eta"), ("预计备妥", "ready")))
     st.markdown(f'<div class="eta-strip">{cards}</div>', unsafe_allow_html=True)
     st.caption(f"地面 · {result['ground_reason']}　｜　空地 · {result['air_reason']}")
     branches = {item["mode"]: item for item in result["branches"]}
     winner = branches.get(mode)
     other = branches.get({"ground": "air", "air": "ground"}.get(mode))
     if mode == "wait":
-        st.write("等待复核，复核时可重新评估资源和交付时限。")
-    elif other and winner["on_time"] != other["on_time"]:
-        st.write(f"该方式预计准时 {winner['on_time']} 单，另一方式预计准时 {other['on_time']} 单。")
-    elif other and winner["ground_on_time"] != other["ground_on_time"]:
-        st.write("两种方式预计准时总数相同，推荐方式能多保障仅地面订单。")
-    elif other and winner["eta"] < other["eta"]:
-        st.write("两种方式的预计准时表现相同，推荐方式预计更早送达。")
-    elif other:
-        st.write("两种方式的预计准时表现和送达时间相同，采用地面直送。")
+        st.write("等待复核。后续有资源可用时重新评估。")
+    elif other and winner["total_minutes"] < other["total_minutes"]:
+        st.write("推荐方式的预计配送总耗时更短。")
     else:
-        st.write("该方式能排入当前资源，另一方式无法在备妥时启动。")
+        st.write("推荐方式可按当前共享运力安排。")
     if draft["disturbance"] and draft["disturbance"].kind != "demand":
         st.dataframe([{"条件": title, "推荐方式": MODES[guide["mode"]],
                        "地面 ETA": hhmm(guide["ground_eta"]), "空地 ETA": hhmm(guide["air_eta"])}
@@ -379,11 +384,11 @@ def result_panel(draft):
     if result["branches"]:
         with st.expander("查看试排依据"):
             st.dataframe([{"分支": MODES[branch["mode"]], "本单 ETA": hhmm(branch["eta"]),
-                           "预计准时数": branch["on_time"], "仅地面预计准时数": branch["ground_on_time"]}
+                           "预计完成数": branch["completed"], "预计总耗时（分钟）": branch["total_minutes"]}
                           for branch in result["branches"]], hide_index=True, width="stretch")
 
 
-def order_panel(defaults):
+def order_panel(defaults, settings):
     s = st.session_state
     st.subheader("新单配送建议")
     prefix = f"point_{s.map_revision}_"
@@ -405,7 +410,7 @@ def order_panel(defaults):
         weight = st.number_input("包裹重量 kg（0 为业务默认）", min_value=0., max_value=1000., step=.1)
     st.caption("在地图上选择取货点和目的地，也可填写坐标。")
     ordered_at = datetime.combine(day, when).isoformat(timespec="minutes")
-    signature = digest([ordered_at, coords, business, weight, s.source, s.network_version])
+    signature = digest([ordered_at, coords, business, weight, s.source, s.network_version, settings, s.ground_model.version])
     draft = s.draft
     same = draft and draft["signature"] == signature
     requested = st.button("计算配送建议", type="primary", width="stretch",
@@ -416,8 +421,12 @@ def order_panel(defaults):
             order = new_order(order_id, clock(when), *coords, business, rng(int(signature[:8], 16), 6), source="manual")
             if weight:
                 order = replace(order, kg=weight)
-            normal = manual_preview(s.network, order)
-            result = manual_preview(s.network, order, s.disturbance) if s.disturbance else normal
+            ready = s.ground_model.ready(order)
+            order = replace(order, ready=ready, deadline=max(order.deadline, ready))
+            options = dict(ground_model=s.ground_model, settings=settings)
+            normal = manual_preview(s.network, order, **options)
+            result = (manual_preview(s.network, order, s.disturbance, **options)
+                      if s.disturbance and s.disturbance.kind != "demand" else normal)
             s.draft = draft = dict(signature=signature, order=order, ordered_at=ordered_at,
                                    normal=normal, result=result, disturbance=s.disturbance,
                                    confirmed=bool(same and draft["confirmed"]))
@@ -491,29 +500,95 @@ def manual_history():
             st.caption("确认配送方式后，可以在这里登记实际送达。")
 
 
+def resource_panel(count):
+    s = st.session_state
+    key = (s.map_revision, s.network_version, count)
+    if s.get("auto_resources_key") != key:
+        automatic = operating_settings(s.operation_profile, s.network, count)
+        orders = generate(s.operation_profile, count, 201)
+        automatic["aircraft_by_hub"] = fleet_estimate(s.network, orders)
+        s.auto_resources, s.auto_resources_key = automatic, key
+    settings = dict(s.auto_resources)
+    with st.sidebar.expander("运力配置"):
+        st.caption(f"默认高峰在线 {max(settings['rider_hours'])} 名骑手，"
+                   f"全网 {sum(settings['aircraft_by_hub'].values())} 架无人机。")
+        manual = st.checkbox("手动设置骑手和无人机")
+        hours = pd.DataFrame({"时段": [f"{hour:02d}:00" for hour in range(24)], "在线骑手": settings["rider_hours"]})
+        fleet = pd.DataFrame({"Hub": list(settings["aircraft_by_hub"]),
+                              "无人机": list(settings["aircraft_by_hub"].values())})
+        editor_key = digest(key)[:12]
+        if manual:
+            hours = st.data_editor(hours, key=f"rider_hours_{editor_key}", hide_index=True,
+                                   disabled=["时段"], column_config={"在线骑手": st.column_config.NumberColumn(
+                                       required=True, min_value=0, max_value=500, step=1)})
+            if not fleet.empty:
+                fleet = st.data_editor(fleet, key=f"fleet_{editor_key}", hide_index=True, disabled=["Hub"],
+                                       column_config={"无人机": st.column_config.NumberColumn(
+                                           required=True, min_value=0, max_value=100, step=1)})
+        else:
+            st.dataframe(hours, hide_index=True, height=180)
+            if not fleet.empty:
+                st.dataframe(fleet, hide_index=True, height=155)
+        settings["rider_hours"] = hours["在线骑手"].astype(int).tolist()
+        settings["aircraft_by_hub"] = {hub: int(count) for hub, count in zip(fleet.Hub, fleet["无人机"])}
+        if manual:
+            st.caption(f"当前高峰在线 {max(settings['rider_hours'])} 人，共 {sum(settings['aircraft_by_hub'].values())} 架无人机。")
+        for field, label, default in (("battery", "每 Hub 备用电池", 6), ("pads", "每站起降位", 1),
+                                       ("swap", "每 Hub 换电位", 1), ("charge", "每 Hub 充电位", 2)):
+            settings[field] = st.number_input(label, 0, 100, default, step=1)
+    return settings
+
+
 def show_comparison(rows, suffix):
     if not rows:
         return
-    summary = summarize_results(rows)
-    versions = {row["network_sha256"] for row in summary}
-    if len(versions) == 1 and next(iter(versions)):
-        st.caption(f"结果航网版本 · {next(iter(versions))[:12]}")
+
+    def formatted(value, pattern):
+        return format(value, pattern) if value is not None else "无配对样本"
+
     table = []
-    for row in summary:
-        item = {"场景": SCENARIOS[row["scenario"]], "策略": STRATEGIES[row["strategy"]],
-                "已完成日数": row["days"]}
-        if len(versions) > 1:
-            item["航网版本"] = row["network_sha256"][:12] or "旧版"
-        for title, numerator, denominator, metric in (
-                ("全体", "on_time", "arrivals", "on_time_rate"),
-                ("仅地面", "ground_on_time", "ground_only", "ground_on_time_rate")):
-            rate, delta = row[metric], row[f"{metric}_delta"]
-            item[f"{title}准时率"] = (f"{rate:.1%}（{row[numerator]:,}/{row[denominator]:,}）"
-                                      if rate is not None else "无样本（0/0）")
-            item[f"{title}较纯地面"] = f"{delta:+.1f} pp" if delta is not None else "无配对样本"
-        table.append(item)
+    for row in rows:
+        table.append({"策略": STRATEGIES[row["strategy"]], "已送达／到达": f"{row['completed']}／{row['arrivals']}",
+                      "完成率": formatted(row["completion_rate"], ".1%"), "未送达": row["undelivered"],
+                      "配对单数": row["paired_orders"], "单均节省（分钟）": formatted(row["saved_minutes"], "+.1f"),
+                      "耗时降幅": formatted(row["time_reduction"], "+.1%"),
+                      "仅地面配对数": row["paired_ground"],
+                      "仅地面少等（分钟）": formatted(row["saved_ground_wait"], "+.1f"),
+                      "仅地面 P90 缩短（分钟）": formatted(row["saved_ground_p90"], "+.1f"),
+                      "净节省骑手分钟": row["saved_rider_minutes"]})
+    st.caption("与纯地面逐单配对。时长只计两侧均已送达的订单。节省为负表示耗时或占用增加。")
     st.dataframe(table, hide_index=True, width="stretch")
-    flat = [{k: v for k, v in row.items() if not isinstance(v, dict)} for row in rows]
+    breakdown = pd.DataFrame([{"策略": STRATEGIES[row["strategy"]], "时段": hhmm(item["hour"]*60),
+                               "区域": f"骑手初始区域 {item['zone']}", "任务": item["activity"],
+                               "骑手分钟": item["minutes"]}
+                              for row in rows for item in row["rider_breakdown"]])
+    if not breakdown.empty:
+        st.markdown("**骑手占用**")
+        choice = st.radio("查看维度", ["按策略", "按时段和区域"], horizontal=True)
+        if choice == "按时段和区域":
+            names = list(breakdown["策略"].unique())
+            strategy, region = st.columns(2)
+            name = strategy.selectbox("策略", names)
+            zone = region.selectbox("骑手初始区域", ["全部", *sorted(breakdown["区域"].unique())])
+            breakdown = breakdown[breakdown["策略"].eq(name)]
+            if zone != "全部":
+                breakdown = breakdown[breakdown["区域"].eq(zone)]
+        dimension = "策略" if choice == "按策略" else "时段"
+        chart = breakdown.groupby([dimension, "任务"], as_index=False)["骑手分钟"].sum()
+        st.bar_chart(chart, x=dimension, y="骑手分钟", color="任务", stack=True)
+
+    case_row = next((row for row in reversed(rows) if row.get("example")), None)
+    with st.expander("查看骑手时间重新分配案例"):
+        if case_row:
+            case = case_row["example"]
+            st.write(f"{STRATEGIES[case_row['strategy']]}中，可飞单 {case['flyable']} 改为空地接驳。"
+                     f"骑手 {case['rider']} 在 {hhmm(case['start'])} 至 {hhmm(case['end'])} "
+                     f"为仅地面单 {case['ground_only']} 服务，该单提前 {case['earlier_start']} 分钟派发、"
+                     f"提前 {case['earlier_delivery']} 分钟送达。")
+        else:
+            st.caption("本轮已完成策略中没有找到可核对的同骑手转用案例。")
+
+    flat = [{k: v for k, v in row.items() if not isinstance(v, (dict, list))} for row in rows]
     first, second = st.columns(2)
     first.download_button("下载对照 CSV", pd.DataFrame(flat).to_csv(index=False).encode("utf-8-sig"),
                           "batch.csv", "text/csv", on_click="ignore", key=f"batch_csv_{suffix}")
@@ -521,24 +596,26 @@ def show_comparison(rows, suffix):
                            on_click="ignore", key=f"batch_json_{suffix}")
 
 
-def batch_panel():
+def batch_panel(settings):
     s = st.session_state
-    st.subheader("运营策略对照")
+    st.subheader("配送效率对照")
     job = s.get("batch")
     busy = bool(job and not job["future"].done())
     count_col, action = st.columns([1, 1.45], vertical_alignment="bottom")
-    count = count_col.number_input("运营订单数／模拟日", 1, 500, 201, step=1)
+    count = count_col.number_input("本轮仿真订单数", 1, 500, 201, step=1, key="efficiency_count")
     ready = s.operation_profile is not None
-    if action.button("运行策略对照", type="primary", width="stretch", disabled=busy or not ready):
+    if action.button("运行配送效率对照", type="primary", width="stretch", disabled=busy or not ready):
         try:
             profile = s.operation_profile
             queues, cancelled = SimpleQueue(), Event()
             network, disturbance = s.network, s.disturbance
             future = worker_pool().submit(run_batch, profile, network, (201,), ("normal",),
-                                          orders_per_day=count, disturbance=disturbance,
+                                          orders_per_day=count, disturbance=disturbance, settings=settings,
+                                          ground_model=s.ground_model, include_orders=True,
                                           cancelled=cancelled.is_set, progress=queues.put)
             s.batch = {"future": future, "queue": queues, "cancelled": cancelled, "rows": [],
-                       "count": count, "version": s.network_version, "done": False, "disturbance": disturbance}
+                       "count": count, "version": s.network_version, "done": False, "disturbance": disturbance,
+                       "peak_riders": max(settings["rider_hours"]), "fleet": sum(settings["aircraft_by_hub"].values())}
             st.rerun()
         except DATA_ERRORS as error:
             st.error(f"无法启动策略对照 · {error}")
@@ -552,7 +629,8 @@ def batch_panel():
                     break
             changed = job["disturbance"]
             condition = f" · {DISTURBANCES[changed.kind]} {changed.percent}%" if changed else ""
-            st.caption(f"本次输入 · {job['count']} 单 · 种子 201 · 航网 {job['version'][:12]}{condition}")
+            st.caption(f"本次输入 · {job['count']} 单 · 高峰在线 {job['peak_riders']} 名骑手 · "
+                       f"{job['fleet']} 架无人机 · 航网 {job['version'][:12]}{condition}")
             count_done = len(job["rows"])
             st.progress(count_done / len(STRATEGIES), text=f"策略已完成 {count_done}／{len(STRATEGIES)}")
             if job["future"].done():
@@ -560,7 +638,7 @@ def batch_panel():
                     job["done"] = True
                     st.rerun()
                 if error := job["future"].exception():
-                    st.error(f"策略对照失败 · {error}")
+                    st.error(f"配送效率对照失败 · {error}")
                 elif job["cancelled"].is_set() and count_done < len(STRATEGIES):
                     st.info("已取消。下方显示本次已完成的策略。")
                 if count_done < len(STRATEGIES):
@@ -569,7 +647,7 @@ def batch_panel():
                 show_comparison(job["rows"], "current")
             elif job["cancelled"].is_set():
                 st.caption("正在停止当前策略…")
-            elif st.button("取消策略对照"):
+            elif st.button("取消对照"):
                 job["cancelled"].set()
         progress_panel()
 
@@ -595,6 +673,7 @@ def main():
     if network is None:
         return
     disturbance_panel()
+    settings = resource_panel(s.get("efficiency_count", 201))
     defaults = ((network.routes[0].pickup, network.routes[0].dropoff) if network.routes
                 else (network.origin, network.origin))
     st.divider()
@@ -602,7 +681,7 @@ def main():
     with map_column:
         map_panel(defaults)
     with order_column:
-        order_panel(defaults)
+        order_panel(defaults, settings)
     manual_history()
     st.divider()
-    batch_panel()
+    batch_panel(settings)

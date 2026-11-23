@@ -99,8 +99,8 @@ def test_batch_matching_hashes_import_and_cancel(profile, tmp_path):
 
 
 def test_foreign_profile_build_switches_the_manual_coordinates():
-    payload = (b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time\n"
-               b"35.68,139.750,35.69,139.77,12:00\n")
+    payload = (b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,fetch_time,arrived_time\n"
+               b"35.68,139.750,35.69,139.77,12:00,12:05,12:19\n")
     net = construct(prepare(payload), [], "b" * 64, 25)
     assert net.origin == (35.685, 139.76)
     assert net.diagnostics["planning"] == 25
@@ -111,9 +111,9 @@ def test_foreign_profile_build_switches_the_manual_coordinates():
 
 
 def test_manual_source_split_uses_each_input_record_at_most_once():
-    payload = (b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,weight_kg\n"
-               + b"35.68,139.75,35.69,139.77,12:00,0.7\n" * 10
-               + b"35.68,139.75,35.69,139.77,12:30,2.2\n" * 8)
+    payload = (b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,fetch_time,arrived_time,weight_kg\n"
+               + b"35.68,139.75,35.69,139.77,12:00,12:05,12:19,0.7\n" * 10
+               + b"35.68,139.75,35.69,139.77,12:30,12:35,12:49,2.2\n" * 8)
     plan, operation = split_sources(prepare(payload), 12, 6)
     planned, operated = planning_sample(plan), planning_sample(operation)
     assert (len(planned), len(operated)) == (12, 6)
@@ -123,8 +123,8 @@ def test_manual_source_split_uses_each_input_record_at_most_once():
 
 def test_planning_day_change_updates_operation_range_and_builds_from_selected_days(monkeypatch):
     entrypoint = Path(__file__).resolve().parents[1] / "streamlit_app.py"
-    header = b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,dt_seq_id\n"
-    rows = "".join(f"35.68,139.75,35.69,139.77,12:00,{day}\n" for day in range(1, 8))
+    header = b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,fetch_time,arrived_time,dt_seq_id\n"
+    rows = "".join(f"35.68,139.75,35.69,139.77,12:00,12:05,12:19,{day}\n" for day in range(1, 8))
     upload = BytesIO(header + rows.encode())
     upload.file_id, upload.name = "days", "days.csv"
     monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload)
@@ -155,8 +155,8 @@ def test_single_page_manual_delivery(monkeypatch):
     assert any(expander.label == "建网参数" for expander in app.sidebar.expander)
     assert app.session_state.network is None
 
-    upload = BytesIO(b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,weight_kg\n"
-                     + b"35.68,139.75,35.69,139.77,12:00,1.1\n" * 6)
+    upload = BytesIO(b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,fetch_time,arrived_time,weight_kg\n"
+                     + b"35.68,139.75,35.69,139.77,12:00,12:05,12:19,1.1\n" * 6)
     upload.file_id, upload.name = "test-file", "test.csv"
     monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload)
     app.run()
@@ -172,7 +172,8 @@ def test_single_page_manual_delivery(monkeypatch):
     assert net.diagnostics["planning"] == 6
     assert net.diagnostics["potential"] == 0
     assert net.rules.weight == 1.05 and Network.from_dict(asdict(net)) == net
-    assert any(heading.value == "运营策略对照" for heading in app.subheader)
+    assert any(heading.value == "配送效率对照" for heading in app.subheader)
+    assert any(expander.label == "运力配置" for expander in app.sidebar.expander)
 
     def button(label):
         return next(widget for widget in app.button if widget.label == label)
@@ -188,3 +189,13 @@ def test_single_page_manual_delivery(monkeypatch):
     assert not app.exception
     assert len(app.session_state.manual_store.list()) == 1
     assert app.session_state.manual_store.list()[0].delivered_at.endswith("T12:28")
+
+    widget = next(item for item in app.number_input if item.label == "本轮仿真订单数")
+    widget.set_value(3).run()
+    button("运行配送效率对照").click().run()
+    app.session_state.batch["future"].result(timeout=10)
+    app.run()
+    assert not app.exception
+    assert len(app.session_state.batch["rows"]) == 4
+    assert all(row["arrivals"] == 3 for row in app.session_state.batch["rows"])
+    assert any("单均节省（分钟）" in frame.value.columns for frame in app.dataframe)

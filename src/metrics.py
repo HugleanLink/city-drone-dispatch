@@ -1,5 +1,5 @@
 import numpy as np
-from .model import END, START
+from .model import START
 
 
 def metrics(run):
@@ -13,7 +13,7 @@ def metrics(run):
     for resource,slots in run.cal.slots.items():
         if resource.startswith("rider:"):
             for s in slots:
-                rider_minutes[s.activity]=rider_minutes.get(s.activity,0)+max(0,min(s.end,run.now,END)-max(s.start,START))
+                rider_minutes[s.activity]=rider_minutes.get(s.activity,0)+max(0,min(s.end,run.now)-max(s.start,START))
     windows={}
     for group in ("aircraft","pad","swap","charge"):
         resource_ids={id for r in run.hubs.values() for id in r.get(group,[])}

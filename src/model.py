@@ -15,7 +15,7 @@ STRATEGIES = {
     "lookahead": "多订单试排",
 }
 MODES = {"ground": "地面直送", "air": "空地接驳", "wait": "等待复核"}
-START, LAST_ARRIVAL, END = 600, 1200, 1320
+START, LAST_ARRIVAL, END = 0, 1440, 1440
 
 
 @dataclass(frozen=True)
@@ -189,7 +189,7 @@ def minutes(km, speed):
 
 
 def ground_time(km, depart):
-    return minutes(km, 13 if 690 <= depart < 810 or 1020 <= depart < 1200 else 18)
+    return minutes(km, 13 if 690 <= depart % 1440 < 810 or 1020 <= depart % 1440 < 1200 else 18)
 
 
 def match_order(network, order):

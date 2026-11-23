@@ -32,14 +32,15 @@ def test_generation_is_seeded_and_nested(source):
     high=generate(profile,302,201,"heavy")
     assert high[:201]==normal
     assert len({o.id for o in high})==302
-    assert all(600<=o.arrival<1200 and o.ready<=o.deadline for o in high)
+    assert all(0<=o.arrival<1440 and o.ready<=o.deadline for o in high)
 
 
 def test_input_validations():
-    data=b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,package_price\n0,0,0,.01,12:00,\n91,0,0,.01,12:00,10\n"
+    data=b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,fetch_time,arrived_time,package_price\n0,0,0,.01,23:57,00:05,00:25,\n91,0,0,.01,12:00,12:05,12:15,10\n"
     p=prepare(data)
     assert p.report["输入"]==2 and p.report["坐标异常"]==1
     assert p.report["窗口内可用"]==1
+    assert p.rows.iloc[0].reference_minutes == 20 and p.rows.iloc[0].pre_pickup == 8
     with pytest.raises(ValueError,match="缺少"):
         prepare(b"test\n0\n")
 
