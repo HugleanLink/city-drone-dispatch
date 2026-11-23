@@ -43,7 +43,8 @@ STYLE = """
             padding: .65rem .9rem; margin: .4rem 0 .65rem; }
 .decision small { color: #4e6379; }
 .decision strong { display: block; font-size: 1.25rem; color: #122338; }
-div[data-testid=stMetric] { background: white; }
+div[data-testid=stMetric] { background: white; padding: .55rem .7rem; }
+[data-testid=stMetricValue], [data-testid=stMetricValue] > div { font-size: 1.28rem; }
 </style>
 """
 
