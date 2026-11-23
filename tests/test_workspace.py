@@ -84,10 +84,11 @@ def test_batch_matching_hashes_import_and_cancel(profile, tmp_path):
         assert len({row["input_sha256"] for row in group}) == 1
     summary = summarize_results(load_results(json.dumps(rows).encode()))
     assert summary[0]["arrivals"] == 12
-    assert summary[0]["on_time_rate_delta"] == 0
+    assert summary[0]["on_time_rate_delta"] is None
     for item in summary:
         same = [row for row in rows if row["strategy"] == item["strategy"]]
-        assert item["on_time_rate"] == sum(row["on_time"] for row in same) / 12
+        assert item["on_time_rate"] is None
+        assert all(row["deadline_orders"] == 0 for row in same)
     path = tmp_path / "batch.csv"
     write_results(rows, path)
     assert summarize_results(load_results(path.read_bytes(), csv_file=True)) == summary

@@ -178,6 +178,10 @@ def load_results(payload, csv_file=False):
         if not (0 <= ground_timely <= ground <= total and ground_timely <= timely <= total
                 and timely - ground_timely <= total - ground):
             raise ValueError("准时订单数与分母不一致")
+        due = int(row.get("deadline_orders", total))
+        ground_due = int(row.get("ground_deadline_orders", ground))
+        if not (timely <= due <= total and ground_timely <= ground_due <= ground and ground_due <= due):
+            raise ValueError("带时限订单数与分母不一致")
         group = network, row["scenario"], numbers["seed"]
         if group_hashes.setdefault(group, row["input_sha256"]) != row["input_sha256"]:
             raise ValueError("同一场景和种子的策略输入哈希不一致")
@@ -186,8 +190,9 @@ def load_results(payload, csv_file=False):
             raise ValueError("对照结果有重复的策略记录")
         seen.add(item_id)
         validated.append({**row, **numbers, "network_sha256": network,
-                          "on_time_rate": timely / total if total else None,
-                          "ground_on_time_rate": ground_timely / ground if ground else None})
+                          "deadline_orders": due, "ground_deadline_orders": ground_due,
+                          "on_time_rate": timely / due if due else None,
+                          "ground_on_time_rate": ground_timely / ground_due if ground_due else None})
     return validated
 
 
@@ -206,13 +211,15 @@ def summarize_results(rows):
         for numerator, denominator, metric in (("on_time", "arrivals", "on_time_rate"),
                                                 ("ground_on_time", "ground_only", "ground_on_time_rate")):
             total = sum(row[denominator] for row in items)
+            due_field = "deadline_orders" if numerator == "on_time" else "ground_deadline_orders"
+            due = sum(row.get(due_field, row[denominator]) for row in items)
             timely = sum(row[numerator] for row in items)
             differences = []
             for row in items:
                 other = pairs.get((network, scenario, row["seed"], row["input_sha256"]))
                 if other and row[metric] is not None and other[metric] is not None:
                     differences.append(100 * (row[metric] - other[metric]))
-            result.update({numerator: timely, denominator: total, metric: timely / total if total else None,
+            result.update({numerator: timely, denominator: total, metric: timely / due if due else None,
                            f"{metric}_delta": sum(differences) / len(differences) if differences else None,
                            f"{metric}_paired_days": len(differences)})
         summary.append(result)

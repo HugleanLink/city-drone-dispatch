@@ -105,8 +105,8 @@ def rng(seed, stream):
 
 
 def new_order(id, minute, pickup, dropoff, business, random, price=None, source="generated"):
-    _, low, high, deadline, kg_min, kg_max = BUSINESS[business]
-    return Order(id, minute, minute+int(random.integers(low, high+1)), minute+deadline,
+    _, low, high, kg_min, kg_max = BUSINESS[business]
+    return Order(id, minute, minute+int(random.integers(low, high+1)), None,
                  tuple(pickup), tuple(dropoff), business, round(float(random.uniform(kg_min, kg_max)), 2),
                  price, source=source)
 

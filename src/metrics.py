@@ -5,7 +5,10 @@ from .model import START
 def metrics(run):
     records=[r for r in run.records.values() if r["status"] not in ("scheduled","removed")]
     completed=[r for r in records if r["actual"] is not None]
-    timely=[r for r in completed if r["actual"]<=r["order"].deadline]
+    due = [r for r in records if r["order"].deadline is not None]
+    due_completed = [r for r in due if r["actual"] is not None]
+    timely = [r for r in due_completed if r["actual"] <= r["order"].deadline]
+    ground_due = sum(r["order"].ground_only for r in due)
     ground=[r for r in records if r["order"].ground_only]
     ground_timely=sum(r["order"].ground_only for r in timely)
     elapsed=[r["actual"]-r["order"].arrival for r in completed]
@@ -40,8 +43,9 @@ def metrics(run):
                  for s in slots if s.activity=="载货起飞" and s.start<=run.now and s.order in station_handoff]
     return {"arrivals":len(records),"completed":len(completed),"on_time":len(timely),
             "ground_only":len(ground),"ground_on_time":ground_timely,
-            "on_time_rate":ratio(len(timely),len(records)),"ground_on_time_rate":ratio(ground_timely,len(ground)),
-            "delivered_on_time_rate":ratio(len(timely),len(completed)),
+            "deadline_orders": len(due), "ground_deadline_orders": ground_due,
+            "on_time_rate":ratio(len(timely),len(due)),"ground_on_time_rate":ratio(ground_timely,ground_due),
+            "delivered_on_time_rate":ratio(len(timely),len(due_completed)),
             "completion_rate":ratio(len(completed),len(records)),
             "mean_minutes":float(np.mean(elapsed)) if elapsed else None,
             "p90_minutes":float(np.percentile(elapsed,90)) if elapsed else None,

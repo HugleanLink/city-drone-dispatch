@@ -422,7 +422,7 @@ def order_panel(defaults, settings):
             if weight:
                 order = replace(order, kg=weight)
             ready = s.ground_model.ready(order)
-            order = replace(order, ready=ready, deadline=max(order.deadline, ready))
+            order = replace(order, ready=ready)
             options = dict(ground_model=s.ground_model, settings=settings)
             normal = manual_preview(s.network, order, **options)
             result = (manual_preview(s.network, order, s.disturbance, **options)

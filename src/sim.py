@@ -141,7 +141,7 @@ class Engine:
     def validate(self, order):
         if not max(START,self.now+1)<=order.arrival<LAST_ARRIVAL:
             raise ValueError("下单时间须位于接单窗口内且尚未处理")
-        if not order.arrival<=order.ready<=order.deadline or not isfinite(order.kg) or order.kg<=0 or order.business not in BUSINESS:
+        if (order.ready < order.arrival or (order.deadline is not None and order.deadline < order.arrival)) or not isfinite(order.kg) or order.kg<=0 or order.business not in BUSINESS:
             raise ValueError("请检查业务、重量、备妥时间和交付时限")
         return match_order(self.network,order)
 
@@ -164,7 +164,7 @@ class Engine:
     def prepare_order(self, order):
         if self.ground_model:
             ready = self.ground_model.ready(order)
-            order = replace(order, ready=ready, deadline=max(order.deadline, ready))
+            order = replace(order, ready=ready)
         return self.validate(order)
 
     def rider_start(self, rider, at):
@@ -336,8 +336,8 @@ class Engine:
         return self._ground(order,cal,now,force),self._air(order,cal,now,force)
 
     def _rank(self, order, options):
-        if self.ground_model:
-            return (not any(options), order.ready, not order.ground_only, order.id)
+        if self.ground_model or order.deadline is None:
+            return (3 if any(options) else 4, order.ready, not order.ground_only, order.ready, order.id)
         punctual=[plan for plan in options if plan and plan.eta<=order.deadline]
         if len(punctual)==1:
             return (0,order.deadline-punctual[0].eta,order.deadline,order.ready,order.id)
@@ -353,11 +353,12 @@ class Engine:
         first_ready=max(now,order.ready)
         immediate=self.opts(order,now=first_ready,force=True)
         branches=[]
+        efficiency = self.ground_model is not None or order.deadline is None
         for mode, fixed in [("ground",immediate[0]),("air",immediate[1]),("wait",None)]:
             if mode!="wait" and fixed is None:
                 continue
             calendar=self.cal.fork()
-            queue = sorted(others, key=lambda row: (row.ready, row.id))[:12] if self.ground_model else list(others)
+            queue = sorted(others, key=lambda row: (row.ready, row.id))[:12] if efficiency else list(others)
             projected={}
             if fixed:
                 calendar.reserve(fixed)
@@ -368,7 +369,7 @@ class Engine:
                 if cancelled():
                     return None, None
                 choices=[(row,self.opts(row,calendar,max(now,first_ready+1) if row.id==order.id else now))
-                         for row in queue if self.ground_model or row.deadline>=now]
+                         for row in queue if efficiency or row.deadline is None or row.deadline>=now]
                 if not choices:
                     # Late work is last in the priority sequence, so it cannot improve a punctual score.
                     # Keep a possible immediate alternative to dispatch when the waiting branch wins.
@@ -383,7 +384,7 @@ class Engine:
                 if selected:
                     calendar.reserve(selected)
                     projected[row.id]=(row,selected)
-            timely=[row for row,p in projected.values() if p.eta<=row.deadline]
+            timely = [row for row, p in projected.values() if row.deadline is not None and p.eta <= row.deadline]
             own=projected.get(order.id,(None,None))[1]
             alternative=None
             if mode=="wait":
@@ -397,7 +398,7 @@ class Engine:
                              "total_minutes": sum(p.eta - row.arrival for row, p in projected.values()),
                              "ground_wait": sum(p.first - row.ready for row, p in projected.values() if row.ground_only),
                              "eta":own.eta if own else None,"plan":fixed,"alternative":alternative})
-        if self.ground_model:
+        if efficiency:
             top = min(branches, key=lambda b: (-b["completed"], b["total_minutes"], b["ground_wait"],
                                                b["mode"] == "wait", b["mode"] != "ground"))
         else:
@@ -417,7 +418,7 @@ class Engine:
 
     def _air_reason(self,order,plan):
         if plan:
-            return "已找到可行的航空及接驳排程" if self.ground_model else ("预计准时" if plan.eta<=order.deadline else "预计超过截止")
+            return "已找到可行的航空及接驳排程" if self.ground_model or order.deadline is None else ("预计准时" if plan.eta<=order.deadline else "预计超过截止")
         if order.ground_only:
             return order.eligibility
         route=self.routes[order.route_id]

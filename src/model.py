@@ -3,10 +3,10 @@ from math import asin, ceil, cos, hypot, isfinite, radians, sin, sqrt
 from functools import lru_cache
 
 BUSINESS = {
-    "waimai": ("外卖", 4, 12, 35, .3, 1.5),
-    "pinhaofan": ("拼好饭", 3, 10, 40, .3, 1.2),
-    "shangou": ("闪购", 1, 6, 45, .5, 3.0),
-    "health": ("医药健康", 1, 8, 45, .2, 1.5),
+    "waimai": ("外卖", 4, 12, .3, 1.5),
+    "pinhaofan": ("拼好饭", 3, 10, .3, 1.2),
+    "shangou": ("闪购", 1, 6, .5, 3.0),
+    "health": ("医药健康", 1, 8, .2, 1.5),
 }
 STRATEGIES = {
     "ground": "纯地面",
@@ -23,7 +23,7 @@ class Order:
     id: str
     arrival: int
     ready: int
-    deadline: int
+    deadline: int | None
     pickup: tuple[float, float]
     dropoff: tuple[float, float]
     business: str
@@ -40,7 +40,7 @@ class Order:
 
     @classmethod
     def from_dict(cls, row):
-        return cls(**{**row, "pickup": tuple(row["pickup"]), "dropoff": tuple(row["dropoff"])})
+        return cls(**{"deadline": None, **row, "pickup": tuple(row["pickup"]), "dropoff": tuple(row["dropoff"])})
 
 
 @dataclass(frozen=True)

@@ -48,7 +48,8 @@ class ManualRecord:
         if (ordered_at.tzinfo is not None or order.arrival != ordered_at.hour * 60 + ordered_at.minute
                 or not START <= order.arrival < LAST_ARRIVAL):
             raise ValueError("下单时间无效")
-        if (order.source != "manual" or not order.arrival <= order.ready <= order.deadline
+        if (order.source != "manual" or order.ready < order.arrival
+                or (order.deadline is not None and order.deadline < order.arrival)
                 or order.business not in BUSINESS or not isfinite(order.kg) or order.kg <= 0):
             raise ValueError("手工订单参数无效")
         for point in (order.pickup, order.dropoff):

@@ -32,7 +32,7 @@ def test_generation_is_seeded_and_nested(source):
     high=generate(profile,302,201,"heavy")
     assert high[:201]==normal
     assert len({o.id for o in high})==302
-    assert all(0<=o.arrival<1440 and o.ready<=o.deadline for o in high)
+    assert all(0<=o.arrival<1440 and o.arrival <= o.ready and o.deadline is None for o in high)
 
 
 def test_input_validations():
