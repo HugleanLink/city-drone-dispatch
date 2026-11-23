@@ -152,6 +152,7 @@ def test_single_page_manual_delivery(monkeypatch):
     app = AppTest.from_file(entrypoint, default_timeout=20).run()
     assert not app.exception
     assert not app.button
+    assert any(expander.label == "建网参数" for expander in app.sidebar.expander)
     assert app.session_state.network is None
 
     upload = BytesIO(b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,weight_kg\n"

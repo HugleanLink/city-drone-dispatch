@@ -1,4 +1,4 @@
-"""Streamlit entry point for day-group planning and dispatch."""
+"""Streamlit entry point for the network planning and dispatch dashboard."""
 
 from src.ui import main
 

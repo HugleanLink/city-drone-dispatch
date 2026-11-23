@@ -30,13 +30,12 @@ DATA_ERRORS = (ValueError, TypeError, OSError, KeyError, OverflowError, EOFError
 STYLE = """
 <style>
 .block-container { max-width: 1510px; padding-top: 2.6rem; padding-bottom: 3rem; }
-.page-banner { display: block; width: 100%; max-height: clamp(140px, 22vw, 310px); object-fit: cover;
-               border-radius: 14px; margin-bottom: 1.1rem; }
-.brand-title { display: flex; align-items: center; gap: .85rem; }
-.brand-title img { width: clamp(38px, 4.5vw, 60px); height: auto; flex-shrink: 0; }
-.app-title { color: #122338; font-weight: 750; font-size: clamp(1.5rem, 3vw, 2.45rem);
-             letter-spacing: -.045em; line-height: 1.18; margin-bottom: .4rem; }
-.app-subtitle { color: #52677e; margin-bottom: 1.3rem; font-size: .95rem; }
+.brand-title { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center;
+               column-gap: .85rem; row-gap: .3rem; margin-bottom: 1.3rem; }
+.brand-title img { display: block; width: clamp(38px, 4.5vw, 60px); height: auto; }
+.brand-title .app-title { color: #122338; font-weight: 750; font-size: clamp(1.5rem, 3vw, 2.45rem);
+                          letter-spacing: -.045em; line-height: 1.18; margin: 0; padding: 0; }
+.app-subtitle { grid-column: 2; color: #52677e; font-size: .95rem; }
 .decision { background: white; border-left: 4px solid #0e766e; border-radius: 8px;
             padding: .65rem .9rem; margin: .4rem 0 .65rem; }
 .decision small { color: #4e6379; }
@@ -94,19 +93,18 @@ def initialize():
 
 
 def planning_settings():
-    with st.expander("建网参数"):
-        first, second, third = st.columns(3)
-        weight = first.number_input("包裹最大重量 kg", min_value=.01, value=2., step=.1)
-        order_min = second.number_input("最短取送直线距离 km", min_value=0., value=1., step=.1)
-        order_max = third.number_input("最长取送直线距离 km", min_value=.01, value=4.04, step=.1)
-        access = first.number_input("每端最大直线接驳距离 km", min_value=.01, value=3., step=.1)
-        leg_min = second.number_input("最短 Hub–接驳站航段 km", min_value=.01, value=.5, step=.1)
-        leg_max = third.number_input("最长 Hub–接驳站航段 km", min_value=.01, value=6.06, step=.1)
-        hubs = first.number_input("Hub 数量上限（0 为不限）", min_value=0, value=15, step=1)
-        spokes = second.number_input("接驳站数量上限（0 为不限）", min_value=0, value=10, step=1)
-        corridors = third.number_input("可调度航段数量上限（0 为不限）", min_value=0, value=0, step=1)
-        eps = first.number_input("DBSCAN 邻域半径 km（0 为自动）", min_value=0., value=0., step=.05)
-        minimum = second.number_input("DBSCAN 最小样本数（0 为自动）", min_value=0, value=0, step=1)
+    with st.sidebar.expander("建网参数"):
+        weight = st.number_input("包裹最大重量 kg", min_value=.01, value=2., step=.1)
+        order_min = st.number_input("最短取送直线距离 km", min_value=0., value=1., step=.1)
+        order_max = st.number_input("最长取送直线距离 km", min_value=.01, value=4.04, step=.1)
+        access = st.number_input("每端最大直线接驳距离 km", min_value=.01, value=3., step=.1)
+        leg_min = st.number_input("最短 Hub–接驳站航段 km", min_value=.01, value=.5, step=.1)
+        leg_max = st.number_input("最长 Hub–接驳站航段 km", min_value=.01, value=6.06, step=.1)
+        hubs = st.number_input("Hub 数量上限（0 为不限）", min_value=0, value=15, step=1)
+        spokes = st.number_input("接驳站数量上限（0 为不限）", min_value=0, value=10, step=1)
+        corridors = st.number_input("可调度航段数量上限（0 为不限）", min_value=0, value=0, step=1)
+        eps = st.number_input("DBSCAN 邻域半径 km（0 为自动）", min_value=0., value=0., step=.05)
+        minimum = st.number_input("DBSCAN 最小样本数（0 为自动）", min_value=0, value=0, step=1)
         exclude = st.checkbox("拼好饭仅走地面", value=True)
         st.caption("订单距离与接驳半径按直线计算。CSV 没有重量时，使用按业务类型生成的重量。站点候选来自上传 CSV 的取送点。")
     rules = dict(weight=weight, order_min=order_min, order_max=order_max, access_km=access,
@@ -144,7 +142,7 @@ def day_ranges(group_count, source):
     return plan, operation
 
 
-def data_panel():
+def data_panel(rules, settings):
     s = st.session_state
     st.subheader("导入与建网")
     upload = st.file_uploader("导入运行数据", type=["csv", "gz"], key="data_file")
@@ -210,7 +208,6 @@ def data_panel():
         st.error("规划订单数不能超过规划来源数量。")
         valid = False
     include = st.checkbox("纳入已完成的新单", value=True, key="include_manual")
-    rules, settings = planning_settings()
     if st.button("分析并构建航网", type="primary", disabled=not valid):
         try:
             with st.spinner(f"正在分析 {planning if count is None else count:,} 条规划订单并构建航网…"):
@@ -319,7 +316,7 @@ def map_panel(defaults):
         endpoints = {route.hub_site or route.hub, route.spoke_site or route.spoke}
         affected = is_resource and (d.site in endpoints if d.kind == "pad" else d.site == route.hub)
         folium.PolyLine([route.pickup, route.dropoff], color="#c7212a",
-                        weight=2, opacity=.85, dash_array="6 4" if affected else None,
+                        weight=2, opacity=.68 if affected else .42, dash_array="6 4" if affected else None,
                         tooltip=f"{route.id} · {route.km:.2f} km" + (" · 运力受限" if affected else "")).add_to(layers)
         sites[route.hub] = (route.pickup, "Hub", is_resource and (d.site in (route.hub_site, route.hub)))
         sites[route.spoke] = (route.dropoff, "接驳站", is_resource and d.site in (route.spoke_site, route.spoke))
@@ -578,22 +575,21 @@ def batch_panel():
 
 
 @st.cache_data(show_spinner=False)
-def header_images():
-    assets = ROOT / "assets"
-    return tuple(b64encode((assets / name).read_bytes()).decode("ascii") for name in ("banner.jpg", "cauc.png"))
+def header_logo():
+    return b64encode((ROOT / "assets" / "cauc.png").read_bytes()).decode("ascii")
 
 
 def main():
     st.set_page_config(page_title=TITLE, layout="wide", page_icon="✈️")
     st.markdown(STYLE, unsafe_allow_html=True)
     initialize()
-    banner, logo = header_images()
-    st.markdown(f'<img class="page-banner" src="data:image/jpeg;base64,{banner}" alt="项目横幅">'
-                f'<div class="brand-title"><img src="data:image/png;base64,{logo}" alt="中国民航大学">'
-                f'<div><div class="app-title">{TITLE}</div>'
-                '<div class="app-subtitle">Drone Delivery Network and Air–Ground Dispatch</div></div></div>',
+    logo = header_logo()
+    st.markdown(f'<div class="brand-title"><img src="data:image/png;base64,{logo}" alt="中国民航大学">'
+                f'<h1 class="app-title">{TITLE}</h1>'
+                '<div class="app-subtitle">Drone Delivery Network and Air–Ground Dispatch</div></div>',
                 unsafe_allow_html=True)
-    data_panel()
+    rules, settings = planning_settings()
+    data_panel(rules, settings)
     s = st.session_state
     network = s.network
     if network is None:
