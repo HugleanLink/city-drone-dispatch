@@ -43,3 +43,12 @@ def test_four_strategies_pair_totals_and_keep_plan_version():
     assert all(row["saved_minutes"] == row["saved_rider_minutes"] == row["undelivered"] == 0 for row in rows)
     assert all(row["rider_minutes"] == sum(e["minutes"] for e in row["rider_breakdown"]) for row in rows)
     assert Disturbance("battery", "H01", 50, 1430, 1470).end == 1470
+
+
+def test_research_aircraft_scenario_with_only_one_available_plane():
+    data = profile()
+    network = mechanism_network()
+    rows = run_batch(data, network, (201,), ("aircraft",), orders_per_day=1,
+                     settings={"aircraft": 1, "rider_hours": [2] * 24}, ground_model=fit(data))
+    assert len(rows) == 4
+    assert all(row["resource_event"]["count"] == 1 and row["completed"] == 1 for row in rows)

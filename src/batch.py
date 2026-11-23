@@ -112,17 +112,14 @@ def run_batch(profile, network, seeds, scenarios, *, hub=None, settings=None, or
                 orders = adjust_demand(orders, profile, seed, applied)
             elif applied:
                 event = resolve_restriction(prototype, applied)
-            elif scenario in ("battery", "aircraft", "pad"):
-                if not selected_hub:
-                    raise ValueError("资源受限场景需要至少一个启用 Hub")
+            elif selected_hub and scenario in ("battery", "aircraft", "pad"):
                 route = next(r for r in network.routes if r.hub == selected_hub)
                 site = (route.hub_site or route.hub) if scenario == "pad" else selected_hub
                 capacity, start, end = {"battery": (3, 720, 740), "aircraft": (2, 720, 740),
                                         "pad": (1, 730, 745)}[scenario]
                 ids = prototype.resources(scenario, site)[:capacity]
-                if len(ids) != capacity:
-                    raise ValueError(f"场景 {scenario} 的初始资源不足")
-                event = scenario, site, capacity, start, end, ids
+                if ids:
+                    event = scenario, site, len(ids), start, end, ids
 
             applied_data = asdict(applied) if applied else None
             input_hash = digest({"orders": [asdict(o) for o in orders], "event": event,
@@ -151,6 +148,8 @@ def run_batch(profile, network, seeds, scenarios, *, hub=None, settings=None, or
                     row["orders"] = trial[0]
                 row["calibration"] = ground_model.version if ground_model else None
                 row["settings"] = run_settings
+                row["resource_event"] = event and {"kind": event[0], "site": event[1],
+                                                  "count": event[2], "start": event[3], "end": event[4]}
                 output.append(row)
                 progress(row)
     return output
