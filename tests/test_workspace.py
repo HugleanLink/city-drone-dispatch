@@ -1,6 +1,7 @@
 import json
 from dataclasses import asdict, replace
 from datetime import time
+from pathlib import Path
 from threading import Event
 
 import pytest
@@ -107,7 +108,8 @@ def test_foreign_profile_build_switches_the_manual_coordinates():
 
 
 def test_single_page_manual_delivery():
-    app = AppTest.from_file("streamlit_app.py", default_timeout=20).run()
+    entrypoint = Path(__file__).resolve().parents[1] / "streamlit_app.py"
+    app = AppTest.from_file(entrypoint, default_timeout=20).run()
     assert not app.exception
     assert any(heading.value == "运营策略对照" for heading in app.subheader)
     app.button(key="load_sample").click().run()
