@@ -96,18 +96,32 @@ def new_order(id, minute, pickup, dropoff, business, random, price=None, source=
                  price, source=source)
 
 
+def sources(profile):
+    groups = sorted(profile.rows.group.unique())
+    if len(groups) >= 7:
+        return {"planning": groups[:4], "operation": groups[4:7]}
+    return {"planning": groups, "operation": groups}
+
+
+def source_counts(profile):
+    pools = sources(profile)
+    return {key: int(profile.rows.loc[profile.rows.group.isin(groups), "count"].sum())
+            for key, groups in pools.items()}
+
+
 def generate(profile, count, seed, purpose="operation", window=None, prefix=None):
     if not 0 <= count <= 100000 or seed < 0:
         raise ValueError("订单数量或种子超出允许范围")
-    groups = sorted(profile.rows.group.unique())
-    if purpose == "planning" and len(groups) >= 7:
-        base = count//4
+    pools = sources(profile)
+    split = pools["planning"] != pools["operation"]
+    if purpose == "planning" and split:
+        base = count // len(pools["planning"])
         orders = []
-        for i, group in enumerate(groups[:4]):
-            size = base+(i < count%4)
+        for i, group in enumerate(pools["planning"]):
+            size = base + (i < count % len(pools["planning"]))
             orders.extend(sample(profile.rows[profile.rows.group.eq(group)], size, seed+i, f"P{i+1}"))
         return orders
-    rows = profile.rows[profile.rows.group.isin(groups[4:7])] if purpose != "planning" and len(groups) >= 7 else profile.rows
+    rows = profile.rows[profile.rows.group.isin(pools["operation"])] if split else profile.rows
     if window:
         rows = rows[rows.minute.ge(window[0]) & rows.minute.lt(window[1])]
     if purpose == "heavy" and count >= 201 and not window:

@@ -302,7 +302,7 @@ class Engine:
     def _best(options):
         return min((p for p in options if p),key=lambda p:(p.eta,p.mode!="ground",p.first),default=None)
 
-    def evaluate(self, order, others=(), now=None):
+    def evaluate(self, order, others=(), now=None, *, cancelled=lambda: False):
         now=self.now if now is None else now
         normal=self.opts(order,now=now)
         first_ready=max(now,order.ready)
@@ -320,6 +320,8 @@ class Engine:
             else:
                 queue.append(order)
             while queue:
+                if cancelled():
+                    return None, None
                 choices=[(row,self.opts(row,calendar,max(now,first_ready+1) if row.id==order.id else now))
                          for row in queue if row.deadline>=now]
                 if not choices:
@@ -406,8 +408,8 @@ class Engine:
         self.version+=1
         self.log.append({"minute":self.now,"type":"dispatch","id":order.id,"mode":plan.mode})
 
-    def dispatch(self):
-        while True:
+    def dispatch(self, cancelled=lambda: False):
+        while not cancelled():
             if not any(end<=self.now for end,_ in self.cal.tails.values()):
                 return
             ready=[r["order"] for r in self.records.values() if r["status"]=="waiting"]
@@ -421,6 +423,8 @@ class Engine:
                 options.sort(key=lambda pair:self._rank(*pair))
             dispatched=False
             for o, plans in options:
+                if cancelled():
+                    return
                 r=self.records[o.id]
                 if self.strategy=="ground":
                     choice=plans[0]
@@ -437,7 +441,9 @@ class Engine:
                 can_start=self.opts(o,force=True) if self.strategy=="lookahead" and choice and choice.first!=self.now else None
                 if self.strategy=="lookahead" and (choice and choice.first==self.now or can_start and any(can_start)):
                     others=[item["order"] for key,item in self.records.items() if key!=o.id and item["status"] in ("waiting","unready")]
-                    guide,branch=self.evaluate(o,others)
+                    guide,branch=self.evaluate(o,others,cancelled=cancelled)
+                    if guide is None:
+                        return
                     self._intent(o,guide)
                     if branch["plan"]:
                         self._commit(o,branch["plan"]);dispatched=True
@@ -552,7 +558,7 @@ class Engine:
                 _,_,_,kind,id,payload=heapq.heappop(self.events)
                 self._event(kind,id,payload)
             if self.now<END:
-                self.dispatch()
+                self.dispatch(cancelled)
             else:
                 for record in self.records.values():
                     if record["status"] in ("waiting","unready","assigned"):

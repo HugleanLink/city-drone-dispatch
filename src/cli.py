@@ -49,6 +49,7 @@ def main():
     bat=sub.add_parser("batch")
     bat.add_argument("--profile",required=True,type=Path); bat.add_argument("--network",required=True,type=Path)
     bat.add_argument("--seeds",default="201:230"); bat.add_argument("--scenarios",nargs="+",choices=SCENARIOS,default=list(SCENARIOS))
+    bat.add_argument("--orders-per-day", type=int, help="覆盖每个场景的默认运营订单数")
     bat.add_argument("--out",required=True,type=Path)
     serve=sub.add_parser("serve"); serve.add_argument("--port",default=8501,type=int); serve.add_argument("--workspace",type=Path)
     args=parser.parse_args()
@@ -83,7 +84,8 @@ def main():
         network=Network.from_dict(read(args.network))
         seed=args.seeds.split(":")
         seeds=range(int(seed[0]),int(seed[-1])+1)
-        rows=run_batch(profile,network,seeds,args.scenarios,progress=lambda row:print(row["scenario"],row["seed"],row["strategy"],flush=True))
+        rows = run_batch(profile, network, seeds, args.scenarios, orders_per_day=args.orders_per_day,
+                         progress=lambda row: print(row["scenario"], row["seed"], row["strategy"], flush=True))
         save(args.out/"batch.json",rows)
         write_results(rows,args.out/"batch.csv")
     return 0

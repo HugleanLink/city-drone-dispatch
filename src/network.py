@@ -7,18 +7,37 @@ from .model import Network, Route, minutes, match_order
 
 
 def _points(network, endpoints, prefix):
-    xy = np.array([network.xy(point) for point in endpoints])
-    labels = DBSCAN(eps=.55, min_samples=10).fit_predict(xy)
-    unique, counts = np.unique(xy, axis=0, return_counts=True)
-    high_frequency = sorted(zip(unique, counts), key=lambda x:(-x[1], *x[0]))
+    xy = np.asarray([network.xy(point) for point in endpoints])
+    unique, first, inverse, counts = np.unique(
+        xy, axis=0, return_index=True, return_inverse=True, return_counts=True
+    )
+    # Preserve first occurrence, which DBSCAN uses for ambiguous border points.
+    order = np.argsort(first)
+    samples = unique[order]
+    weights = counts[order]
+    if len(samples) <= 4_000:
+        ordered_labels = DBSCAN(eps=.55, min_samples=10).fit_predict(samples, sample_weight=weights)
+    else:
+        # Bound neighborhood memory for dense, non-gridded input.
+        cells, positions = np.unique(np.floor(samples * 2 + .5) / 2, axis=0, return_inverse=True)
+        cell_weights = np.bincount(positions, weights=weights)
+        cell_labels = DBSCAN(eps=.55, min_samples=10).fit_predict(cells, sample_weight=cell_weights)
+        ordered_labels = cell_labels[positions]
+    unique_labels = np.empty(len(unique), dtype=int)
+    unique_labels[order] = ordered_labels
+    high_frequency = sorted(zip(map(tuple, unique), counts), key=lambda item: (-item[1], *item[0]))
+    clusters = sorted(set(unique_labels) - {-1},
+                      key=lambda label: (-int(counts[unique_labels == label].sum()), label))
     representatives = []
-    for label in sorted(set(labels)-{-1}, key=lambda label:(-int((labels==label).sum()),label)):
-        cluster = xy[labels==label]
-        center = cluster.mean(axis=0)
-        representatives.append(min(map(tuple, cluster), key=lambda p:(np.linalg.norm(np.array(p)-center), *p)))
-    selected = list(dict.fromkeys(representatives+[tuple(p) for p,_ in high_frequency]))[:20]
-    frequency = {tuple(p):int(n) for p,n in high_frequency}
-    return [(f"{prefix}{i+1:02}", network.latlon(*p), frequency[p]) for i,p in enumerate(sorted(selected))], labels
+    for label in clusters:
+        group = unique_labels == label
+        cluster = unique[group]
+        center = np.average(cluster, axis=0, weights=counts[group])
+        representatives.append(min(map(tuple, cluster), key=lambda p: (np.linalg.norm(p - center), *p)))
+    selected = list(dict.fromkeys(representatives + [point for point, _ in high_frequency]))[:20]
+    frequency = {point: int(n) for point, n in high_frequency}
+    return [(f"{prefix}{i+1:02}", network.latlon(*p), frequency[p])
+            for i, p in enumerate(sorted(selected))], unique_labels[inverse]
 
 
 def build(orders, origin=None, *, max_hubs=3, max_spokes=4, max_routes=6, extent=None):
@@ -45,35 +64,45 @@ def build(orders, origin=None, *, max_hubs=3, max_spokes=4, max_routes=6, extent
         return replace(base, diagnostics={"planning":len(orders),"potential":0,"covered":0,"routes":0})
     hubs, origins = _points(base,[o.pickup for o in potential],"H")
     spokes, destinations = _points(base,[o.dropoff for o in potential],"S")
-    direct = np.array([minutes(base.road(o.pickup,o.dropoff),18)+2 for o in potential])
+    direct = np.array([minutes(base.road(o.pickup, o.dropoff), 18) - 2 for o in potential], dtype=np.int32)
+    first_legs, last_legs = [], []
+    for candidates, name, output in ((hubs, "pickup", first_legs), (spokes, "dropoff", last_legs)):
+        endpoints = [getattr(order, name) for order in potential]
+        positions = list(dict.fromkeys(endpoints))
+        indices = {point: i for i, point in enumerate(positions)}
+        inverse = np.asarray([indices[point] for point in endpoints])
+        for site_id, site, _ in candidates:
+            distances = np.asarray([base.road(point, site) for point in positions])[inverse]
+            output.append((site_id, site, distances <= 2.5,
+                           np.ceil(distances * 60 / 18 - 1e-10).astype(np.int32)))
     legs = []
-    for hid, hub, _ in hubs:
-        first = np.array([base.road(o.pickup,hub) for o in potential])
-        for sid, spoke, _ in spokes:
-            km = base.straight(hub,spoke)
+    for hid, hub, first, first_time in first_legs:
+        for sid, spoke, last, last_time in last_legs:
+            km = base.straight(hub, spoke)
             if not .5 <= km <= 4:
                 continue
-            last = np.array([base.road(spoke,o.dropoff) for o in potential])
-            mask = (first<=2.5)&(last<=2.5)
+            mask = first & last
             if mask.any():
-                saving = direct-np.ceil(first*60/18-1e-10)-np.ceil(last*60/18-1e-10)-4
-                route = Route(f"{hid}-{sid}", hid,sid,hub,spoke,km,int(mask.sum()),
-                              _site(hub),_site(spoke))
-                legs.append((route,mask,saving))
+                route = Route(f"{hid}-{sid}", hid, sid, hub, spoke, km, int(mask.sum()),
+                              _site(hub), _site(spoke))
+                legs.append((route, mask, first_time, last_time))
     covered = np.zeros(len(potential), dtype=bool)
     used_h, used_s, chosen = set(), set(), []
     while len(chosen)<max_routes:
-        legal = [(route,mask,saving) for route,mask,saving in legs
-                 if (route.hub in used_h or len(used_h)<max_hubs)
-                 and (route.spoke in used_s or len(used_s)<max_spokes)
-                 and (mask & ~covered).any()]
-        if not legal:
-            break
         def rank(item):
-            route,mask,saving = item
+            route, mask, first_time, last_time = item
             added = mask & ~covered
-            return (-int(added.sum()),-int(saving[added].sum()),route.km,route.id)
-        route,mask,_ = min(legal,key=rank)
+            count = int(added.sum())
+            saving = (direct[added] - first_time[added] - last_time[added]).sum()
+            return (-count, -int(saving), route.km, route.id)
+
+        legal = (item for item in legs
+                 if (item[0].hub in used_h or len(used_h) < max_hubs)
+                 and (item[0].spoke in used_s or len(used_s) < max_spokes))
+        selected = min(legal, key=rank, default=None)
+        if selected is None or not (selected[1] & ~covered).any():
+            break
+        route, mask, _, _ = selected
         covered |= mask
         chosen.append(route)
         used_h.add(route.hub)
