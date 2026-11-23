@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 
 from src.batch import Disturbance, run_batch
@@ -7,6 +8,7 @@ from src.efficiency import operating_settings
 from src.examples import mechanism_network
 from src.model import Order
 from src.sim import Engine
+from src.storage import encode
 
 
 def profile():
@@ -52,3 +54,18 @@ def test_research_aircraft_scenario_with_only_one_available_plane():
                      settings={"aircraft": 1, "rider_hours": [2] * 24}, ground_model=fit(data))
     assert len(rows) == 4
     assert all(row["resource_event"]["count"] == 1 and row["completed"] == 1 for row in rows)
+
+
+def test_calibrated_snapshot_preserves_ground_eta():
+    data = profile()
+    net = mechanism_network()
+    route = net.routes[0]
+    order = Order("later", 1439, 1439, None, route.pickup, route.dropoff, "waimai", 1.)
+    settings = {"rider_hours": [2] * 24}
+    run = Engine(net, [order], "ground", settings, ground_model=fit(data))
+    run.advance(1439)
+    restored = Engine.restore(json.loads(encode(run.snapshot())))
+    assert restored.ground_model.version == run.ground_model.version
+    for engine in (run, restored):
+        engine.finish()
+    assert run.records == restored.records and run.cal.slots == restored.cal.slots

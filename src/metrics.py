@@ -2,6 +2,24 @@ import numpy as np
 from .model import START
 
 
+def resource_usage(run, resource_ids):
+    occupied=sum(max(0,min(s.end,run.now)-max(s.start,START))
+                 for id in resource_ids for s in run.cal.slots.get(id,()))
+    # Restrictions are reconstructed from the applied events, including restorations.
+    exclusions={}
+    stops={e["id"]:e["minute"] for e in run.log if e["type"]=="restore"}
+    for e in run.log:
+        if e["type"]=="limit":
+            for id in set(e["resources"])&resource_ids:
+                exclusions.setdefault(id,set()).update(range(e["minute"],stops.get(e["id"],run.now)))
+    protected=0
+    for id,blocked in exclusions.items():
+        occupied_times={m for s in run.cal.slots.get(id,()) for m in range(max(s.start,START),min(s.end,run.now))}
+        protected+=len(blocked-occupied_times)
+    available=len(resource_ids)*max(0,run.now-START)-protected
+    return {"used": occupied, "available": available, "ratio": ratio(occupied, available)}
+
+
 def metrics(run):
     records=[r for r in run.records.values() if r["status"] not in ("scheduled","removed")]
     completed=[r for r in records if r["actual"] is not None]
@@ -22,21 +40,7 @@ def metrics(run):
         resource_ids={id for r in run.hubs.values() for id in r.get(group,[])}
         if group=="pad":
             resource_ids={id for ids in run.pads.values() for id in ids}
-        occupied=sum(max(0,min(s.end,run.now)-max(s.start,START))
-                     for id in resource_ids for s in run.cal.slots.get(id,()))
-        # Restrictions are reconstructed from the applied events, including restorations.
-        exclusions={}
-        stops={e["id"]:e["minute"] for e in run.log if e["type"]=="restore"}
-        for e in run.log:
-            if e["type"]=="limit":
-                for id in set(e["resources"])&resource_ids:
-                    exclusions.setdefault(id,set()).update(range(e["minute"],stops.get(e["id"],run.now)))
-        protected=0
-        for id,blocked in exclusions.items():
-            occupied_times={m for s in run.cal.slots.get(id,()) for m in range(max(s.start,START),min(s.end,run.now))}
-            protected+=len(blocked-occupied_times)
-        available=len(resource_ids)*max(0,run.now-START)-protected
-        windows[group]={"used":occupied,"available":available,"ratio":ratio(occupied,available)}
+        windows[group] = resource_usage(run, resource_ids)
     wait=[r["first"]-r["order"].ready for r in records if r.get("first") is not None]
     station_handoff={s.order:s.end for slots in run.cal.slots.values() for s in slots if s.activity=="首段接驳"}
     launch_wait=[s.start-station_handoff[s.order] for slots in run.cal.slots.values()
@@ -48,6 +52,7 @@ def metrics(run):
             "delivered_on_time_rate":ratio(len(timely),len(due_completed)),
             "completion_rate":ratio(len(completed),len(records)),
             "mean_minutes":float(np.mean(elapsed)) if elapsed else None,
+            "p50_minutes":float(np.median(elapsed)) if elapsed else None,
             "p90_minutes":float(np.percentile(elapsed,90)) if elapsed else None,
             "mean_wait":float(np.mean(wait)) if wait else None,
             "mean_launch_wait":float(np.mean(launch_wait)) if launch_wait else None,

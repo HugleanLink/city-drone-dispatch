@@ -10,6 +10,7 @@ from math import ceil
 from .data import clock_window, generate, profile_for_groups, sources
 from .metrics import metrics
 from .efficiency import changes, details, fleet_estimate, operating_settings
+from .diagnostics import diagnostics
 from .model import LAST_ARRIVAL, START, STRATEGIES, match_order
 from .sim import Engine
 from .storage import encode
@@ -122,7 +123,7 @@ def run_batch(profile, network, seeds, scenarios, *, hub=None, settings=None, or
                     event = scenario, site, len(ids), start, end, ids
 
             applied_data = asdict(applied) if applied else None
-            input_hash = digest({"orders": [asdict(o) for o in orders], "event": event,
+            input_hash = digest({"orders": [o.input_dict() for o in orders], "event": event,
                                  "disturbance": applied_data, "settings": run_settings, "network": network_data,
                                  "calibration": ground_model.version if ground_model else None})
             baseline = None
@@ -138,6 +139,8 @@ def run_batch(profile, network, seeds, scenarios, *, hub=None, settings=None, or
                 row = {"seed": seed, "scenario": scenario, "strategy": strategy, "input_sha256": input_hash,
                        "network_sha256": network_hash, "base_orders": count, "disturbance": applied_data,
                        **metrics(run)}
+                measures, routes = diagnostics(run)
+                row.update(measures)
                 trial = details(run)
                 if baseline is None:
                     baseline = trial
@@ -145,7 +148,7 @@ def run_batch(profile, network, seeds, scenarios, *, hub=None, settings=None, or
                 row["undelivered"] = row["arrivals"] - row["completed"]
                 row["rider_breakdown"] = trial[2]
                 if include_orders:
-                    row["orders"] = trial[0]
+                    row["orders"] = {key: {**item, **routes.get(key, {})} for key, item in trial[0].items()}
                 row["calibration"] = ground_model.version if ground_model else None
                 row["settings"] = run_settings
                 row["resource_event"] = event and {"kind": event[0], "site": event[1],

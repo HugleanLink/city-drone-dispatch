@@ -28,6 +28,8 @@ class Plan:
     slots: tuple[Slot, ...]
     rider_ends: tuple
     route: str | None = None
+    # Air timings separate the parcel timeline from the aircraft's full duty cycle.
+    air_times: tuple[int, int, int, int] | None = None
 
 
 class Calendar:
@@ -210,10 +212,25 @@ class Engine:
         travel=(Slot(rider,start,start+empty,"空驶",order_id),) if empty else ()
         return travel+(Slot(rider,start+empty,end,activity,order_id),)
 
-    def _air(self, order, cal, now, force):
-        route=self.routes.get(order.route_id)
-        if not route:
-            return None
+    def _air(self, order, cal, now, force, *, cutoff=None, cancelled=lambda: False):
+        ids = ((order.route_id,) if self.strategy == "fixed" else
+               order.candidate_route_ids or (order.route_id,))
+        best = None
+        for route_id in ids:
+            if cancelled():
+                break
+            route = self.routes.get(route_id)
+            if route is None:
+                continue
+            # A previously found ETA is an upper bound for all remaining routes.
+            # Equal ETAs retain the spatial ranking as the deterministic tie-break.
+            limit = best.eta - 1 if best else cutoff
+            plan = self._air_route(order, route, cal, now, force, limit, cancelled)
+            if plan and (limit is None or plan.eta <= limit):
+                best = plan
+        return best
+
+    def _air_route(self, order, route, cal, now, force, cutoff, cancelled):
         resources=self.hubs[route.hub]
         hub_pads=self.pads[route.hub_site or route.hub]
         spoke_pads=self.pads[route.spoke_site or route.spoke]
@@ -223,21 +240,28 @@ class Engine:
         first_legs=sorted(self._rider_options(cal,order.pickup,route.pickup,order.ready,now,force,order.business),
                           key=lambda x:(x[3],x[0]))
         best=None
+        eta_limit = self.end if cutoff is None else cutoff
         # End-to-end minimum over feasible first rider, plane and final rider.
         # When the earliest feasible chain is already worse, later launches cannot improve it.
         for first,start,fetch,at_hub,empty in first_legs:
-            if best and at_hub+fly+5>best.eta:
+            if cancelled() or at_hub+fly+5>eta_limit:
                 break
             first_slots=self._rider_slots(order.id,first,start,at_hub,empty,"首段接驳")
             tails={**cal.tails, first:(at_hub,route.pickup)}
             for plane in resources["aircraft"]:
                 plane_slots=cal.slots.get(plane,())
-                plane_ready=max([now]+[slot.end for slot in plane_slots])
+                plane_ready=max(now, plane_slots[-1].end) if plane_slots else now
+                if cal.limits.get(plane):
+                    # The aircraft must fit at least a round trip and both handoffs.
+                    plane_ready, _ = cal.next([plane], plane_ready, 2 * fly + 7)
+                    if plane_ready > self.end:
+                        continue
                 mounted=resources["mounted"][plane]
                 batteries=[mounted] if not plane_slots and not cal.slots.get(mounted) else resources["battery"]+[b for b in resources["mounted"].values() if cal.slots.get(b)]
                 for battery in batteries:
                     already_mounted=not plane_slots and battery==mounted and not cal.slots.get(mounted)
-                    batt_ready=max([now]+[s.end for s in cal.slots.get(battery,())])
+                    battery_slots = cal.slots.get(battery, ())
+                    batt_ready = max(now, battery_slots[-1].end) if battery_slots else now
                     takeoff=max(at_hub,plane_ready,batt_ready)
                     mount=()
                     if not already_mounted:
@@ -246,8 +270,8 @@ class Engine:
                             continue
                         mount=(Slot(swap_id,mount_time,mount_time+2,"装电",order.id),)
                         takeoff=max(takeoff,mount_time+2)
-                    latest=min(self.end-2*fly-6,best.eta-fly-4 if best else self.end)
-                    while takeoff<=latest:
+                    latest=min(self.end-2*fly-6,eta_limit-fly-5)
+                    while takeoff<=latest and not cancelled():
                         launch,pad=cal.next(hub_pads,takeoff,1,mount)
                         if not pad or launch>latest:
                             break
@@ -313,6 +337,8 @@ class Engine:
                             extra+=(Slot(charger,charge,charged,"充电",order.id),)
                         for last,(available,loc) in sorted(tails.items()):
                             begin = self.rider_start(last, max(now, available))
+                            if max(begin, deliver_ready) + 2 > eta_limit:
+                                continue
                             travel = self.travel(loc, route.dropoff, begin, order.business, empty=True)
                             if begin + travel < deliver_ready:
                                 begin = self.rider_start(last, deliver_ready - travel)
@@ -321,23 +347,31 @@ class Engine:
                             eta = transfer + 1 + self.travel(route.dropoff, order.dropoff, transfer+1, order.business)
                             if not self.ground_model:
                                 eta += 1
-                            if eta>self.end or (best and (eta,start,first,plane,last)>=(best.eta,best.first,best.rider_ends[0][0],
+                            if eta>eta_limit or (best and (eta,start,first,plane,last)>=(best.eta,best.first,best.rider_ends[0][0],
                                     next(s.resource for s in best.slots if s.activity=="航空任务"),best.rider_ends[-1][0])):
                                 continue
                             last_slots=self._rider_slots(order.id,last,begin,eta,travel,"末段接驳")
                             best=Plan("air",start,eta,fetch,first_slots+extra+last_slots,
-                                      ((first,at_hub,route.pickup),(last,eta,order.dropoff)),route.id)
+                                      ((first,at_hub,route.pickup),(last,eta,order.dropoff)),route.id,
+                                      (at_hub, launch, deliver_ready, transfer))
+                            eta_limit = eta
                         break
         return best
 
-    def opts(self, order, cal=None, now=None, force=False):
+    def opts(self, order, cal=None, now=None, force=False, *, fastest=False, cancelled=lambda: False):
         cal=self.cal if cal is None else cal
         now=self.now if now is None else now
-        return self._ground(order,cal,now,force),self._air(order,cal,now,force)
+        ground = self._ground(order, cal, now, force)
+        cutoff = ground.eta - 1 if fastest and ground else None
+        return ground, self._air(order, cal, now, force, cutoff=cutoff, cancelled=cancelled)
+
+    @staticmethod
+    def _ready_rank(order):
+        return order.ready, not order.ground_only, order.id
 
     def _rank(self, order, options):
         if self.ground_model or order.deadline is None:
-            return (3 if any(options) else 4, order.ready, not order.ground_only, order.ready, order.id)
+            return (3 if any(options) else 4, *self._ready_rank(order))
         punctual=[plan for plan in options if plan and plan.eta<=order.deadline]
         if len(punctual)==1:
             return (0,order.deadline-punctual[0].eta,order.deadline,order.ready,order.id)
@@ -349,9 +383,9 @@ class Engine:
 
     def evaluate(self, order, others=(), now=None, *, cancelled=lambda: False):
         now=self.now if now is None else now
-        normal=self.opts(order,now=now)
+        normal=self.opts(order,now=now,cancelled=cancelled)
         first_ready=max(now,order.ready)
-        immediate=self.opts(order,now=first_ready,force=True)
+        immediate=self.opts(order,now=first_ready,force=True,cancelled=cancelled)
         branches=[]
         efficiency = self.ground_model is not None or order.deadline is None
         for mode, fixed in [("ground",immediate[0]),("air",immediate[1]),("wait",None)]:
@@ -368,13 +402,31 @@ class Engine:
             while queue:
                 if cancelled():
                     return None, None
-                choices=[(row,self.opts(row,calendar,max(now,first_ready+1) if row.id==order.id else now))
-                         for row in queue if efficiency or row.deadline is None or row.deadline>=now]
+                if efficiency and (self.ground_model or all(row.deadline is None for row in queue)):
+                    # Rank by ready time first. A later order cannot overtake the
+                    # first plannable order in this priority sequence.
+                    picked = None
+                    for row in sorted(queue, key=self._ready_rank):
+                        if cancelled():
+                            return None, None
+                        at = first_ready + 1 if row.id == order.id else now
+                        opts = self.opts(row, calendar, at, fastest=True, cancelled=cancelled)
+                        if any(opts):
+                            picked = row, opts
+                            break
+                    if picked is None:
+                        break
+                    choices = [picked]
+                else:
+                    choices = [(row, self.opts(row, calendar, first_ready+1 if row.id == order.id else now,
+                                              cancelled=cancelled))
+                               for row in queue if efficiency or row.deadline is None or row.deadline >= now]
                 if not choices:
                     # Late work is last in the priority sequence, so it cannot improve a punctual score.
                     # Keep a possible immediate alternative to dispatch when the waiting branch wins.
                     choice_rows=[row for row in queue if row.id==order.id or (mode=="wait" and not projected)]
-                    choices=[(row,self.opts(row,calendar,max(now,first_ready+1) if row.id==order.id else now))
+                    choices=[(row,self.opts(row,calendar,max(now,first_ready+1) if row.id==order.id else now,
+                                                   fastest=efficiency, cancelled=cancelled))
                              for row in choice_rows]
                     if not choices:
                         break
@@ -397,14 +449,19 @@ class Engine:
                              "completed": len(projected),
                              "total_minutes": sum(p.eta - row.arrival for row, p in projected.values()),
                              "ground_wait": sum(p.first - row.ready for row, p in projected.values() if row.ground_only),
-                             "eta":own.eta if own else None,"plan":fixed,"alternative":alternative})
+                             "rider_minutes": sum(s.end - s.start for _, p in projected.values()
+                                                  for s in p.slots if s.resource.startswith("rider:")),
+                             "eta":own.eta if own else None,"route_id": own.route if own else None,
+                             "plan":fixed,"alternative":alternative})
         if efficiency:
             top = min(branches, key=lambda b: (-b["completed"], b["total_minutes"], b["ground_wait"],
-                                               b["mode"] == "wait", b["mode"] != "ground"))
+                                               b["rider_minutes"], b["mode"] == "wait", b["mode"] != "ground"))
         else:
             top=min(branches,key=lambda b:(-b["on_time"],-b["ground_on_time"],b["mode"]=="wait",
                                           b["eta"] if b["eta"] is not None else self.end+1,
                                           b["mode"]!="ground"))
+        if cancelled():
+            return None, None
         winning=set(top["on_time_ids"])
         summary=[{k:v for k,v in b.items() if k not in ("plan","alternative")} |
                  {"loses_vs_recommendation":sorted(winning-set(b["on_time_ids"])),
@@ -413,6 +470,9 @@ class Engine:
         guide={"order":order.id,"minute":now,"version":self.version,
                "ground_eta":normal[0].eta if normal[0] else None,"air_eta":normal[1].eta if normal[1] else None,
                "deadline":order.deadline, "ready": order.ready, "mode":top["mode"],"branches":summary,
+               "preferred_route_id": order.route_id, "candidate_route_ids": list(order.candidate_route_ids),
+               "air_route_id": normal[1].route if normal[1] else None,
+               "recommended_route_id": top["route_id"] if top["mode"] == "air" else None,
                "air_reason":self._air_reason(order,normal[1]),"ground_reason":"可排" if normal[0] else "骑手不足或超出仿真时窗"}
         return guide,top
 
@@ -421,20 +481,24 @@ class Engine:
             return "已找到可行的航空及接驳排程" if self.ground_model or order.deadline is None else ("预计准时" if plan.eta<=order.deadline else "预计超过截止")
         if order.ground_only:
             return order.eligibility
-        route=self.routes[order.route_id]
-        resources=self.hubs[route.hub]
-        if not resources["aircraft"]:
+        route_ids = ((order.route_id,) if self.strategy == "fixed" else
+                     order.candidate_route_ids or (order.route_id,))
+        routes = [self.routes[route_id] for route_id in route_ids]
+        routes = [route for route in routes if self.hubs[route.hub]["aircraft"]]
+        if not routes:
             return "无可用飞机"
-        if not self.pads[route.hub_site or route.hub] or not self.pads[route.spoke_site or route.spoke]:
+        routes = [route for route in routes
+                  if self.pads[route.hub_site or route.hub] and self.pads[route.spoke_site or route.spoke]]
+        if not routes:
             return "无可用起降位"
-        if not resources["swap"]:
+        if not any(self.hubs[route.hub]["swap"] for route in routes):
             return "无可用换电位"
         if not self.cal.tails:
             return "无可用骑手"
         return "飞机、电池、起降位或接驳资源无法在时窗内完成预约"
 
     def preview(self,order):
-        order=self.validate(order)
+        order=self.prepare_order(order)
         now=max(order.arrival,self.now)
         others=[record["order"] for record in self.records.values() if record["status"] in ("waiting","unready")]
         result,_=self.evaluate(order,others,now=now)
@@ -449,17 +513,36 @@ class Engine:
         if mode=="air":
             record["ever_air"]=True
         previous=record.get("decision")
-        keys=("mode","ground_eta","air_eta","air_reason")
+        keys=("mode","ground_eta","air_eta","air_route_id","air_reason")
         if not previous or any(guide.get(k)!=previous.get(k) for k in keys):
             self.decisions.append(guide)
             record["decision"]=guide
 
-    def _commit(self,order,plan):
+    def _commit(self,order,plan, cancelled=lambda: False):
+        record = self.records[order.id]
+        comparison = None
+        if plan.route and plan.route != order.route_id:
+            preferred = self._air_route(order, self.routes[order.route_id], self.cal, self.now,
+                                        plan.first == self.now, None, cancelled)
+            if cancelled():
+                return False
+            comparison = {
+                "preferred_route_id": order.route_id, "executed_route_id": plan.route,
+                "preferred_eta": preferred.eta if preferred else None, "executed_eta": plan.eta,
+                "minutes_saved": preferred.eta - plan.eta if preferred else None,
+                "evaluated_at": self.now,
+            }
+        if cancelled():
+            return False
         self.cal.reserve(plan)
-        self.records[order.id].update(status="assigned",mode=plan.mode,first=plan.first,fetch=plan.fetch,eta=plan.eta)
+        if comparison:
+            record["route_comparison"] = comparison
+        record.update(status="assigned",mode=plan.mode,first=plan.first,fetch=plan.fetch,eta=plan.eta,
+                      executed_route_id=plan.route, air_times=plan.air_times)
         self._push(plan.eta,0,"delivered",order.id)
         self.version+=1
-        self.log.append({"minute":self.now,"type":"dispatch","id":order.id,"mode":plan.mode})
+        self.log.append({"minute":self.now,"type":"dispatch","id":order.id,"mode":plan.mode,"route_id":plan.route})
+        return True
 
     def dispatch(self, cancelled=lambda: False):
         while not cancelled():
@@ -471,11 +554,14 @@ class Engine:
             if not ready:
                 return
             if self.strategy in ("ground","fixed"):
-                options=((o,(self._ground(o,self.cal,self.now,False),None) if self.strategy=="ground" else self.opts(o))
+                options=((o,(self._ground(o,self.cal,self.now,False),None) if self.strategy=="ground" else self.opts(o,cancelled=cancelled))
                          for o in sorted(ready,key=lambda o:(o.ready,o.id)))
+            elif self.ground_model or all(o.deadline is None for o in ready):
+                options = ((o, self.opts(o, fastest=True, cancelled=cancelled))
+                           for o in sorted(ready, key=self._ready_rank))
             else:
-                options=[(o,self.opts(o)) for o in ready]
-                options.sort(key=lambda pair:self._rank(*pair))
+                options = [(o, self.opts(o, cancelled=cancelled)) for o in ready]
+                options.sort(key=lambda pair: self._rank(*pair))
             dispatched=False
             for o, plans in options:
                 if cancelled():
@@ -488,14 +574,16 @@ class Engine:
                         target=self.routes[o.route_id].hub if o.route_id and plans[1] else None
                         queued=sum(1 for record in self.records.values()
                                    if record.get("fixed_hub")==target and record.get("fixed_mode")=="air"
-                                   and record["status"]=="waiting")
+                                   and (record["status"]=="waiting" or
+                                        record["status"]=="assigned" and record.get("air_times")
+                                        and record["air_times"][1] > self.now))
                         r.update(fixed_hub=target,fixed_mode="air" if target and queued<8 else "ground")
                     choice=plans[1] if r["fixed_mode"]=="air" else plans[0]
                 else:
                     choice=self._best(plans)
                 if choice and choice.first > self.now:
                     self.retry_at = min(self.retry_at, choice.first)
-                can_start=self.opts(o,force=True) if self.strategy=="lookahead" and choice and choice.first!=self.now else None
+                can_start=self.opts(o,force=True,cancelled=cancelled) if self.strategy=="lookahead" and choice and choice.first!=self.now else None
                 if self.strategy=="lookahead" and (choice and choice.first==self.now or can_start and any(can_start)):
                     others=[item["order"] for key,item in self.records.items() if key!=o.id and item["status"] in ("waiting","unready")]
                     guide,branch=self.evaluate(o,others,cancelled=cancelled)
@@ -503,26 +591,34 @@ class Engine:
                         return
                     self._intent(o,guide)
                     if branch["plan"]:
-                        self._commit(o,branch["plan"]);dispatched=True
-                    elif self.ground_model and not branch["alternative"]:
-                        self.retry_at = min(self.retry_at, self.now + 1)
+                        dispatched = self._commit(o, branch["plan"], cancelled)
                     elif branch["alternative"]:
-                        alternate,plan=branch["alternative"]
-                        actual=self.opts(alternate,force=True)
-                        self._intent(alternate,{"order":alternate.id,"minute":self.now,
-                                               "version":self.version,"mode":plan.mode,
-                                               "ground_eta":actual[0].eta if actual[0] else None,
-                                               "air_eta":actual[1].eta if actual[1] else None,
-                                               "deadline":alternate.deadline,
-                                               "air_reason":self._air_reason(alternate,actual[1]),"branches":[]})
-                        self._commit(alternate,plan)
-                        dispatched=True
+                        alternate, projected = branch["alternative"]
+                        live = self.opts(alternate, force=True, cancelled=cancelled)
+                        # A rollout may have moved another rider in a hypothetical
+                        # assignment. Only a plan built on the live calendar can commit.
+                        plan = live[0 if projected.mode == "ground" else 1]
+                        if plan and not cancelled():
+                            self._intent(alternate, {"order": alternate.id, "minute": self.now,
+                                "version": self.version, "mode": plan.mode,
+                                "ground_eta": live[0].eta if live[0] else None,
+                                "air_eta": live[1].eta if live[1] else None,
+                                "deadline": alternate.deadline, "preferred_route_id": alternate.route_id,
+                                "air_route_id": live[1].route if live[1] else None,
+                                "air_reason": self._air_reason(alternate, live[1]), "branches": []})
+                            dispatched = self._commit(alternate, plan, cancelled)
+                    if not dispatched:
+                        self.retry_at = min(self.retry_at, self.now + 1)
                     break
                 self._intent(o,{"order":o.id,"minute":self.now,"version":self.version,"mode":choice.mode if choice else "wait",
                                 "ground_eta":plans[0].eta if plans[0] else None,"air_eta":plans[1].eta if plans[1] else None,
-                                "deadline":o.deadline,"air_reason":self._air_reason(o,plans[1]),"branches":[]})
+                                "deadline":o.deadline,"preferred_route_id":o.route_id,
+                                "air_route_id":plans[1].route if plans[1] else None,
+                                "air_reason":("无更早送达的可行空地排程" if plans[0] and not plans[1]
+                                              and not o.ground_only and self.strategy in ("dynamic","lookahead")
+                                              else self._air_reason(o,plans[1])),"branches":[]})
                 if choice and choice.first==self.now:
-                    self._commit(o,choice);dispatched=True
+                    dispatched = self._commit(o, choice, cancelled)
                     break
             if not dispatched:
                 return
@@ -567,7 +663,7 @@ class Engine:
         self.version+=1
         self.log.append({"minute":self.now,"type":"demand","added":[o.id for o in additions],"removed":removed})
 
-    def _event(self,kind,id,payload):
+    def _event(self,kind,id,payload,cancelled=lambda: False):
         if kind=="limit":
             candidates=self.resources(payload["kind"],payload["site"])
             active=lambda resource: any(s.end>self.now for s in self.cal.slots.get(resource,()))
@@ -594,7 +690,11 @@ class Engine:
         if kind=="arrival":
             record["status"]="waiting" if order.ready<=self.now else "unready"
             if record["status"]=="unready":
-                record["arrival_estimate"]=dict(zip(("ground_eta","air_eta"),(p.eta if p else None for p in self.opts(order))))
+                fastest = self.strategy in ("dynamic", "lookahead") and (self.ground_model or order.deadline is None)
+                ground, air = self.opts(order, fastest=fastest, cancelled=cancelled)
+                record["arrival_estimate"] = {"ground_eta": ground.eta if ground else None,
+                                              "air_eta": air.eta if air else None,
+                                              "air_route_id": air.route if air else None}
         elif kind=="ready" and record["status"]=="unready":
             record["status"]="waiting"
         elif kind=="delivered":
@@ -616,7 +716,7 @@ class Engine:
             self.now=step
             while self.events and self.events[0][0]<=self.now:
                 _,_,_,kind,id,payload=heapq.heappop(self.events)
-                self._event(kind,id,payload)
+                self._event(kind,id,payload,cancelled)
             if self.now<self.end:
                 self.dispatch(cancelled)
             else:
@@ -647,7 +747,8 @@ class Engine:
 
     def snapshot(self):
         return {"schema_version":1,"run_id":self.run_id,"network":asdict(self.network),
-                "strategy":self.strategy,"settings":self.settings,"end":self.end,"now":self.now,"version":self.version,
+                "strategy":self.strategy,"settings":self.settings,
+                "ground_model":self.ground_model.to_dict() if self.ground_model else None,"end":self.end,"now":self.now,"version":self.version,
                 "seq":self.seq,"events":self.events,"requests":self.requests,
                 "records":{k:{**r,"order":asdict(r["order"])} for k,r in self.records.items()},
                 "slots":{k:[asdict(s) for s in slots] for k,slots in self.cal.slots.items()},
@@ -657,14 +758,22 @@ class Engine:
     def restore(cls,obj, fork=False):
         if obj["schema_version"]!=1:
             raise ValueError("运行包版本不支持")
-        run=cls(Network.from_dict(obj["network"]),strategy=obj["strategy"],settings=obj["settings"])
+        from .calibration import GroundTimes
+
+        calibration = obj.get("ground_model")
+        run=cls(Network.from_dict(obj["network"]),strategy=obj["strategy"],settings=obj["settings"],
+                ground_model=GroundTimes.from_dict(calibration) if calibration else None)
         run.end = run.cal.end = obj.get("end", run.end)
         run.run_id=uuid4().hex[:12] if fork else obj["run_id"]
         run.now,run.version,run.seq=obj["now"],obj["version"],obj["seq"]
         run.events=[tuple(row) for row in obj["events"]]
         heapq.heapify(run.events)
         run.requests=obj["requests"]
-        run.records={k:{**r,"order":Order.from_dict(r["order"])} for k,r in obj["records"].items()}
+        run.records={k:{**r,"order":match_order(run.network,Order.from_dict(r["order"]))}
+                     for k,r in obj["records"].items()}
+        for record in run.records.values():
+            if record.get("air_times") is not None:
+                record["air_times"] = tuple(record["air_times"])
         run.cal.slots.update((k, sorted((Slot(**s) for s in values), key=attrgetter("start")))
                              for k, values in obj["slots"].items())
         run.cal.limits.update(obj["limits"])

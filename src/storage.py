@@ -8,6 +8,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .model import END
 from .sim import Engine
 
 RUN_ID = re.compile(r"[0-9a-f]{12}")
@@ -86,16 +87,23 @@ class RunStore:
             z.writestr("events.jsonl","\n".join(encode(e) for e in run.log))
             z.writestr("decisions.jsonl","\n".join(encode(e) for e in run.decisions))
             from .metrics import metrics
-            z.writestr("metrics.json",encode(metrics(run)))
+            from .diagnostics import diagnostics
+            summary, order_details = diagnostics(run)
+            z.writestr("metrics.json", encode({**metrics(run), **summary}))
+            z.writestr("order_diagnostics.json", encode(order_details))
             rows=io.StringIO()
             writer=csv.writer(rows)
-            writer.writerow(["order_id","mode","resource","activity","planned_start","planned_end","actual_elapsed"])
+            writer.writerow(["order_id","mode","resource","activity","planned_start","planned_end","actual_elapsed",
+                             "preferred_route_id","executed_route_id"])
             for resource,slots in run.cal.slots.items():
                 for slot in slots:
                     if slot.order in run.records:
-                        mode=run.records[slot.order]["mode"]
+                        record = run.records[slot.order]
                         actual=max(0,min(slot.end,run.now)-slot.start)
-                        writer.writerow([slot.order,mode,resource,slot.activity,slot.start,slot.end,actual])
+                        writer.writerow([slot.order, record["mode"], resource, slot.activity, slot.start,
+                                         slot.end, actual, record["order"].route_id,
+                                         record.get("executed_route_id", record["order"].route_id
+                                                    if record["mode"] == "air" else None)])
             z.writestr("calibration_stages.csv",rows.getvalue().encode("utf-8-sig"))
             z.write(self.path(run.run_id),"orders.sqlite3")
         return output.getvalue()
@@ -106,7 +114,8 @@ class RunStore:
             if item.file_size>MAX_SNAPSHOT:
                 raise ValueError("运行包超过 50 MB 解压上限")
             obj=json.loads(z.read(item))
-        if not 599<=obj["now"]<=1320 or len(obj["records"])>5000:
+        count = len(obj["records"])
+        if count > 5000 or not -1 <= obj["now"] <= obj.get("end", END) <= END + 2880 * (count + 1):
             raise ValueError("运行包的时钟或订单数量超出范围")
         run=Engine.restore(obj,fork=True)
         self.save(run)

@@ -37,6 +37,7 @@ class ManualRecord:
     disturbance: dict | None
     chosen_mode: str
     delivered_at: str | None = None
+    chosen_route_id: str | None = None
 
     def __post_init__(self):
         if not MANUAL_ID.fullmatch(self.order.id) or not SOURCE_ID.fullmatch(self.source):
@@ -64,6 +65,10 @@ class ManualRecord:
                     raise ValueError("预计送达时间无效")
         if self.chosen_mode not in ("ground", "air") or self.result[f"{self.chosen_mode}_eta"] is None:
             raise ValueError("请选择可执行的配送方式")
+        if self.chosen_route_id is not None and (self.chosen_mode != "air"
+                or self.chosen_route_id != self.result.get("air_route_id")
+                or self.chosen_route_id not in order.candidate_route_ids):
+            raise ValueError("确认航段须与可执行的空地方案一致")
         if self.delivered_at is not None:
             arrival = datetime.fromisoformat(self.delivered_at)
             if arrival.tzinfo is not None or arrival < ordered_at:
@@ -180,7 +185,7 @@ def construct(profile, records, source, count, include_manual=True, *, no_replac
     network = build(orders, profile.origin, extent=profile_extent(profile), **settings)
     checksum = sha256()
     for order in orders:
-        checksum.update((encode(order.__dict__) + "\n").encode("utf-8"))
+        checksum.update((encode(order.input_dict()) + "\n").encode("utf-8"))
     diagnostics = {**network.diagnostics, "returned_orders": returned,
                    "planning_input_sha256": checksum.hexdigest()}
     return replace(network, diagnostics=diagnostics)

@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from .calibration import fit
+from .diagnostics import diagnostic_tables
 from .data import KEYS, Profile, generate, prepare, profile_for_groups, sources
 from .model import Network, Order
 from .network import build, covered_rows
@@ -90,10 +91,13 @@ def main():
             parser.error("请先重新运行 prepare-data 以生成地面耗时校准字段")
         ground_model = fit(profile_for_groups(profile, sources(profile)["planning"]))
         rows = run_batch(profile, network, seeds, args.scenarios, orders_per_day=args.orders_per_day,
-                         ground_model=ground_model,
+                         ground_model=ground_model, include_orders=True,
                          progress=lambda row: print(row["scenario"], row["seed"], row["strategy"], flush=True))
         save(args.out/"batch.json",rows)
         write_results(rows,args.out/"batch.csv")
+        for name, table in diagnostic_tables(rows).items():
+            if table:
+                pd.DataFrame(table).to_csv(args.out / f"{name}.csv", index=False, encoding="utf-8-sig")
     return 0
 
 

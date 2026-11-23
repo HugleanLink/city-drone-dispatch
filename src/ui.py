@@ -19,9 +19,10 @@ from streamlit_folium import st_folium
 
 from .batch import DISTURBANCES, Disturbance, adjust_demand, digest, run_batch
 from .calibration import fit
+from .diagnostics import MODE_STAGES, NON_ADDITIVE, STAGES, diagnostic_tables
 from .efficiency import fleet_estimate, operating_settings
 from .data import day_groups, generate, new_order, prepare, profile_for_groups, rng, source_counts, split_sources
-from .model import BUSINESS, MODES, STRATEGIES, FlightRules
+from .model import BUSINESS, MODES, STRATEGIES, FlightRules, match_order
 from .storage import encode
 from .workspace import ManualRecord, ManualStore, construct, manual_preview
 
@@ -369,6 +370,11 @@ def result_panel(draft):
                     for label, key in (("地面直送", "ground_eta"), ("空地接驳", "air_eta"), ("预计备妥", "ready")))
     st.markdown(f'<div class="eta-strip">{cards}</div>', unsafe_allow_html=True)
     st.caption(f"地面 · {result['ground_reason']}　｜　空地 · {result['air_reason']}")
+    air_route = result.get("air_route_id")
+    preferred = result.get("preferred_route_id")
+    if preferred:
+        st.caption(f"空间首选 {preferred} · {len(result['candidate_route_ids'])} 条候选"
+                   + (f" · 空地 ETA 对应 {air_route}" if air_route else ""))
     branches = {item["mode"]: item for item in result["branches"]}
     winner = branches.get(mode)
     other = branches.get({"ground": "air", "air": "ground"}.get(mode))
@@ -380,12 +386,14 @@ def result_panel(draft):
         st.write("推荐方式可按当前共享运力安排。")
     if draft["disturbance"] and draft["disturbance"].kind != "demand":
         st.dataframe([{"条件": title, "推荐方式": MODES[guide["mode"]],
-                       "地面 ETA": hhmm(guide["ground_eta"]), "空地 ETA": hhmm(guide["air_eta"])}
+                       "地面 ETA": hhmm(guide["ground_eta"]), "空地 ETA": hhmm(guide["air_eta"]),
+                       "空地航段": guide.get("air_route_id")}
                       for title, guide in (("无扰动", normal), ("当前扰动", result))],
                      hide_index=True, width="stretch")
     if result["branches"]:
         with st.expander("查看试排依据"):
             st.dataframe([{"分支": MODES[branch["mode"]], "本单 ETA": hhmm(branch["eta"]),
+                           "试排航段": branch.get("route_id"),
                            "预计完成数": branch["completed"], "预计总耗时（分钟）": branch["total_minutes"]}
                           for branch in result["branches"]], hide_index=True, width="stretch")
 
@@ -424,7 +432,7 @@ def order_panel(defaults, settings):
             if weight:
                 order = replace(order, kg=weight)
             ready = s.ground_model.ready(order)
-            order = replace(order, ready=ready)
+            order = match_order(s.network, replace(order, ready=ready))
             options = dict(ground_model=s.ground_model, settings=settings)
             normal = manual_preview(s.network, order, **options)
             result = (manual_preview(s.network, order, s.disturbance, **options)
@@ -459,7 +467,8 @@ def order_panel(defaults, settings):
         try:
             saved = ManualRecord(draft["order"], s.source, s.network_version, draft["ordered_at"],
                                  draft["normal"], draft["result"],
-                                 asdict(draft["disturbance"]) if draft["disturbance"] else None, chosen)
+                                 asdict(draft["disturbance"]) if draft["disturbance"] else None, chosen,
+                                 chosen_route_id=draft["result"].get("air_route_id") if chosen == "air" else None)
             s.manual_store.confirm(saved)
             draft["confirmed"] = True
             st.rerun()
@@ -494,6 +503,7 @@ def manual_history():
         if complete:
             recent = [{"订单": row.order.id[:12], "下单": row.ordered_at.replace("T", " "),
                        "建议": MODES[row.result["mode"]], "人工确认": MODES[row.chosen_mode],
+                       "空间首选": row.result.get("preferred_route_id"), "确认航段": row.chosen_route_id,
                        "地面 ETA": hhmm(row.result["ground_eta"]), "空地 ETA": hhmm(row.result["air_eta"]),
                        "实际送达": row.delivered_at.replace("T", " "), "航网版本": row.network_version[:8]}
                       for row in complete[:100]]
@@ -513,7 +523,8 @@ def resource_panel(count):
     settings = dict(s.auto_resources)
     with st.sidebar.expander("运力配置"):
         st.caption(f"默认高峰在线 {max(settings['rider_hours'])} 名骑手，"
-                   f"全网 {sum(settings['aircraft_by_hub'].values())} 架无人机。")
+                   f"全网 {sum(settings['aircraft_by_hub'].values())} 架无人机。"
+                   "骑手班次按每人每小时 3 单估算，仿真按实际任务耗时逐单占用骑手。")
         manual = st.checkbox("手动设置骑手和无人机")
         hours = pd.DataFrame({"时段": [f"{hour:02d}:00" for hour in range(24)], "在线骑手": settings["rider_hours"]})
         fleet = pd.DataFrame({"Hub": list(settings["aircraft_by_hub"]),
@@ -590,12 +601,75 @@ def show_comparison(rows, suffix):
         else:
             st.caption("本轮已完成策略中没有找到可核对的同骑手转用案例。")
 
+    show_diagnostics(rows, suffix)
     flat = [{k: v for k, v in row.items() if not isinstance(v, (dict, list))} for row in rows]
     first, second = st.columns(2)
     first.download_button("下载对照 CSV", pd.DataFrame(flat).to_csv(index=False).encode("utf-8-sig"),
                           "batch.csv", "text/csv", on_click="ignore", key=f"batch_csv_{suffix}")
     second.download_button("下载完整结果 JSON", encode(rows), "batch.json", "application/json",
                            on_click="ignore", key=f"batch_json_{suffix}")
+
+
+
+def show_diagnostics(rows, suffix):
+    with st.expander("耗时、运力与航段诊断"):
+        summary, stages, riders, hubs, routes = st.tabs(["耗时分布", "阶段耗时", "骑手班次", "Hub 资源", "执行航段"])
+        with summary:
+            st.dataframe([{"策略": STRATEGIES[r["strategy"]], "空间可接入航网": r["air_eligible_orders"],
+                           "实际空运送达": r["delivered_air_orders"], "实际地面送达": r["delivered_ground_orders"],
+                           "平均耗时": r["mean_minutes"], "P50": r["p50_minutes"], "P90": r["p90_minutes"],
+                           "执行航段改变": r["reselected_route_orders"]} for r in rows],
+                         hide_index=True, width="stretch")
+        with stages:
+            st.caption("按实际送达方式分别求均值，单位为分钟。末段空驶、飞机占用和电池周转可与配送并行。")
+            st.dataframe([{"策略": STRATEGIES[r["strategy"]], "送达方式": MODES[mode],
+                           "阶段": STAGES[stage], "平均分钟": round(value, 2),
+                           "计入端到端": stage not in NON_ADDITIVE}
+                          for r in rows for mode, names in MODE_STAGES.items() for stage in names
+                          if (value := r[f"{mode}_{stage}_mean_minutes"]) is not None],
+                         hide_index=True, width="stretch")
+        tables = diagnostic_tables(rows)
+        with riders:
+            st.caption("预订空档为任务已预约但骑手尚未开始该任务的空闲分钟。利用率计入换班后仍在执行的任务。")
+            frame = pd.DataFrame(tables["rider_hourly"])
+            if not frame.empty:
+                frame["hour"] = frame["hour"].map(lambda hour: hhmm(hour * 60))
+                frame["strategy"] = frame["strategy"].map(STRATEGIES)
+                st.dataframe(frame.rename(columns={"strategy": "策略", "hour": "小时",
+                    "scheduled_riders": "计划在线", "scheduled_minutes": "计划骑手分钟",
+                    "worked_minutes": "实际骑手分钟", "tasks_started": "开始任务数",
+                    "carryover_minutes": "跨班骑手分钟", "reserved_idle_minutes": "预订空档分钟",
+                    "utilization": "利用率"}).drop(columns=["seed", "scenario"]), hide_index=True, width="stretch",
+                    column_config={"利用率": st.column_config.NumberColumn(format="percent")})
+        with hubs:
+            frame = pd.DataFrame(tables["hub_resources"])
+            if frame.empty:
+                st.caption("当前航网没有 Hub。")
+            else:
+                frame["strategy"] = frame["strategy"].map(STRATEGIES)
+                groups = {"aircraft": "飞机", "pad": "Hub 起降位", "swap": "换电位",
+                          "charge": "充电位", "battery": "电池"}
+                frame["resource"] = frame["resource"].map(groups)
+                st.dataframe(frame.rename(columns={"strategy": "策略", "tasks": "航空任务数", "resource": "资源",
+                    "used": "占用分钟", "available": "可用分钟", "ratio": "利用率"})
+                    .drop(columns=["seed", "scenario"]), hide_index=True, width="stretch",
+                    column_config={"利用率": st.column_config.NumberColumn(format="percent")})
+        with routes:
+            cases = [{"策略": STRATEGIES[r["strategy"]], "仿真订单": case["order"],
+                      "空间首选": case["preferred_route_id"], "执行航段": case["executed_route_id"],
+                      "首选 ETA": hhmm(case["preferred_eta"]), "执行 ETA": hhmm(case["executed_eta"]),
+                      "预计少用分钟": case["minutes_saved"]} for r in rows for case in r["route_examples"]]
+            if cases:
+                st.dataframe(cases, hide_index=True, width="stretch")
+            else:
+                st.caption("本轮没有找到在同一调度时刻可比较且降低 ETA 的换段案例。")
+        buttons = st.columns(3)
+        for button, (key, label) in zip(buttons, (("rider_hourly", "骑手班次 CSV"),
+                ("hub_resources", "Hub 资源 CSV"), ("order_diagnostics", "订单与航段 CSV"))):
+            if tables[key]:
+                button.download_button(label, pd.DataFrame(tables[key]).to_csv(index=False).encode("utf-8-sig"),
+                                       f"{key}.csv", "text/csv", on_click="ignore",
+                                       key=f"{key}_{suffix}")
 
 
 def batch_panel(settings):

@@ -33,6 +33,11 @@ class Order:
     eligibility: str = "未匹配"
     source: str = "generated"
     reference_minutes: float | None = None
+    candidate_route_ids: tuple[str, ...] = ()
+
+    def input_dict(self):
+        # Candidate ranking is derived from the network and is not a new input.
+        return {key: value for key, value in vars(self).items() if key != "candidate_route_ids"}
 
     @property
     def ground_only(self):
@@ -40,7 +45,8 @@ class Order:
 
     @classmethod
     def from_dict(cls, row):
-        return cls(**{"deadline": None, **row, "pickup": tuple(row["pickup"]), "dropoff": tuple(row["dropoff"])})
+        return cls(**{"deadline": None, **row, "pickup": tuple(row["pickup"]), "dropoff": tuple(row["dropoff"]),
+                      "candidate_route_ids": tuple(row.get("candidate_route_ids") or ())})
 
 
 @dataclass(frozen=True)
@@ -196,7 +202,7 @@ def match_order(network, order):
     if not network.contains(order.pickup) or not network.contains(order.dropoff):
         raise ValueError("取送点须在已载入路网的范围内")
     if reason := network.rejection(order):
-        return replace(order, route_id=None, eligibility=reason)
+        return replace(order, route_id=None, eligibility=reason, candidate_route_ids=())
     eligible = []
     for route in network.routes:
         if (network.access(order.pickup, route.pickup) <= network.rules.access_km
@@ -205,6 +211,7 @@ def match_order(network, order):
             last = network.road(route.dropoff, order.dropoff)
             nominal = minutes(first, 18)+minutes(last, 18)+minutes(route.km, 40)+6
             eligible.append((nominal, route.id))
-    if eligible:
-        return replace(order, route_id=min(eligible)[1], eligibility="可接入航网")
-    return replace(order, route_id=None, eligibility="两端接驳范围内无可用航段")
+    candidates = tuple(route_id for _, route_id in sorted(eligible))
+    if candidates:
+        return replace(order, route_id=candidates[0], eligibility="可接入航网", candidate_route_ids=candidates)
+    return replace(order, route_id=None, eligibility="两端接驳范围内无可用航段", candidate_route_ids=())

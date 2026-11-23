@@ -76,6 +76,18 @@ class GroundTimes:
     samples: int
     version: str
 
+    def to_dict(self):
+        return {"origin": self.origin, "tables": [list(table.items()) for table in self.tables],
+                "prep": list(self.prep.items()), "default_prep": self.default_prep,
+                "reference": self.reference, "samples": self.samples, "version": self.version}
+
+    @classmethod
+    def from_dict(cls, row):
+        return cls(tuple(row["origin"]), tuple({tuple(key): tuple(item) for key, item in entries}
+                                              for entries in row["tables"]),
+                   {tuple(key): item for key, item in row["prep"]}, row["default_prep"],
+                   tuple(row["reference"]), row["samples"], row["version"])
+
     def ready(self, order):
         return order.arrival + ceil(self.prep.get((order.business, order.arrival // 60),
                                                    self.default_prep.get(order.business, 8)))
