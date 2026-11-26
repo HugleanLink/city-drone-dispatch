@@ -1,38 +1,30 @@
 # 城市物流无人机航网规划与空地协同调度系统
 
-**Drone Delivery Network and Air–Ground Dispatch**
+## 建网与订单调度
 
-[打开 Streamlit 在线演示](https://city-drone-dispatch.streamlit.app/)
+1. 上传历史运营 CSV 或 CSV.GZ，选择历史日组。建网默认从所选日组无放回抽取至多 4,000 条记录，也可使用所选日组的全部订单。估时使用所选日组的有效取送记录。
+2. 点击「分析并构建航网」。页面显示拟合得到的适飞距离、站点候选来源、启用站点、可调度路径、综合部署目标和 24 时段估时。
+3. 在侧栏设置三个 8 小时班次的骑手人数和各启用 Hub 的无人机数量。默认骑手配置取班次内历史工作量估算的峰值，无人机默认每个启用 Hub 配 5 架。
+4. 在「订单调度」录入 1–10 笔订单。单笔可在地图上选择取送点，比较地面和空地 ETA，并可手工确认任一可执行方式。多笔通过表格一起录入，系统输出联合分配结果和资源明细。
+5. 确认后，骑手的预计空闲时刻和位置、无人机的下次可用时刻会约束后续订单。本机确认记录写入 SQLite，可登记实际送达。线上记录限于当前会话。
 
-## 在同一页完成建网和调度
+## 算法
 
-1. 从「导入运行数据」上传 CSV 或 CSV.GZ。分别选择规划和运营的日组区间，或填写互不重叠的规划、运营来源数量。规划默认从来源抽取最多 4,000 条，可调整数量或使用全部规划来源。展开侧栏的「建网参数」即可修改阈值，然后点击「分析并构建航网」。
-2. 在 OpenStreetMap 上先后选择取货点和目的地，设置下单时间，计算配送建议。侧栏可按时段限制备用电池、无人机或起降位。应用资源扰动后，可查看同一订单在无扰和受扰条件下的两种 ETA。
-3. 人工确认配送方式后，在「手工订单」填写实际送达日期和时间。同一来源且位于研究范围内的已完成新单可纳入下一次建网。
-4. 在地图下方设置运营订单数（默认 201，网页上限 500），运行「配送效率对照」。用同一批订单对比相对纯地面的单均节省、耗时降幅、仅地面等待和净节省骑手分钟。侧栏可调整分时骑手、各 Hub 的无人机以及电池和站点设施，需求扰动作用于本轮批次。
+- **航网规划。** 以取送球面距离拟合 GMM，以 BIC 选择分量数。对属于目标分量后验概率合计超过 50% 的样本取 P5/P95 形成距离区间。按业务类型及价格赋值。网格以总流量和取送比做四类 K-means，任一类候选缺失时，两类使用 DBSCAN 簇中心。Hub 采用带高耗时加成的贪心覆盖，Spoke 归最近 Hub 并标记孤立。NSGA-II 比较部署成本、价值加权损失率和地面依赖度，在 Pareto 前沿用归一化切比雪夫距离选综合部署方案。
+- **分时估时。** 按取货小时拟合对数有效配送速度的 GMM，用 BIC 选择分量数。样本不足时合并相邻时段，必要时回退到全天。固定随机种子的蒙特卡洛抽样生成每公里耗时 P50/P90，排程使用 P50。
+- **可执行方案。** 新单先核验适飞和两端接驳，再比较地面直送与启用航网中各条可行空地路径。每条路径检查载重和往返航程。各骑手任务在班次内完成，无人机返航和周转后才能接下单。电池、起降位等保障时间计入环节耗时。
+- **调度。** 单笔空地预期节时严格超过所设阈值时采用空地，两种方式中只有一种可行时选该方式。多笔方案在相同的运力快照上，按到达顺序逐单解码，评价价值加权端到端耗时、骑手占用和配送成本。联合调度使用整数编码 NSGA-II；候选组合不超过种群上限时，在首代覆盖全部组合。无完整可行解时，先用单笔方式分配可执行订单，其余留待重算。计算过程在临时状态中进行，确认时在数据库事务内检查预约冲突。
 
-默认建网使用 1–4.04 km 取送直线距离、3 km 两端直线接驳半径和 2 kg 载重门槛，Hub 和接驳站的数量上限默认分别为 15 和 10，设为 0 可使用建网算法筛出的全部候选站点。Hub 使用业务价值加权的贪心覆盖选址。有参考配送时长时纳入高绕行加权。站点候选来自 CSV 的取送点，地图显示可调度的 Hub–接驳站航段。可勾选查看 Hub 间规划走廊。
+## 数据和本机运行
 
-## 数据和记录
-
-`data/demo_orders.csv.gz` 有 592,667 条独立生成的模拟记录，可用于命令行或手工上传，生成命令为 `python -m src.demo_data`。网页按顺序为有效日组编号。默认用前四个有效日组规划，剩余日组用于运营。改变规划日期时自动建议运营日期，也可以手动调整。仅有一个有效日组时，按日组模式共用该日，或改用手动数量拆分。全天接单并允许次日送达。地面耗时按时段、取送区域、距离档和业务类型校准。规划来源用于估时校准，运营来源用于抽样对照。
-
-CSV 最少需要 `customer_pay_time`、`fetch_time`、`arrived_time` 及 `pickup_latitude`、`pickup_longitude`、`dropoff_latitude`、`dropoff_longitude` 四列 WGS84 经纬度。支持 UTF-8 和 GB18030。提供 `weight_kg` 时使用该列，否则按业务类型生成仿真重量。上传由当前 Streamlit 会话处理。线上手工记录随当前会话保存。
-
-## 本机开发和多日对照
-
-支持 Python 3.12 至 3.14。在线底图需要网络连接。
+CSV 最少需要 `customer_pay_time`、`fetch_time`、`arrived_time` 和 `pickup_latitude`、`pickup_longitude`、`dropoff_latitude`、`dropoff_longitude` 四列 WGS84 坐标。支持 UTF-8 和 GB18030。可选字段包括 `dt_seq_id`、`biz_line`、`package_price` 和 `weight_kg`。未提供历史重量时沿用按业务填补的方式。仓库的 `data/demo_orders.csv.gz` 可作为建网输入。在线底图需要联网。
 
 ```powershell
 python -m pip install -r requirements.txt
 python -m src.cli serve
 python -m src.cli prepare-data --input data/demo_orders.csv.gz --out data/generated
-python -m src.cli generate --profile data/generated/profile.csv.gz --purpose planning --count 4000 --seed 101 --out data/generated/planning
-python -m src.cli build-network --orders data/generated/planning/orders.json --profile data/generated/profile.csv.gz --out data/generated/network
-python -m src.cli batch --profile data/generated/profile.csv.gz --network data/generated/network/network.json --seeds 201:230 --out runs/batch
+python -m src.cli build-network --profile data/generated/profile.csv.gz --count 4000 --out data/generated/network
 python -m pytest -q
 ```
 
-多日命令默认保留常态 201 单及其余场景 302 单的口径，可通过 `--orders` 指定统一数量，或通过 `--scenarios normal heavy` 选择复现范围。对照结果写入指定输出目录。
-
-Streamlit Community Cloud 使用本仓库的 `main` 分支和 `streamlit_app.py` 入口。GitHub Actions 验证 Python 3.12 和 3.14。
+原四策略研究脚本与测试留在仓库供归档复核。网页与命令行主入口使用新版建网和手工订单调度。

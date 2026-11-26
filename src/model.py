@@ -60,6 +60,7 @@ class Route:
     coverage: int
     hub_site: str = ""
     spoke_site: str = ""
+    via: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -155,13 +156,14 @@ class Network:
         labels=set()
         routes=[]
         for data in row["routes"]:
-            route=Route(**{**data,"pickup":tuple(data["pickup"]),"dropoff":tuple(data["dropoff"])})
+            route=Route(**{**data,"pickup":tuple(data["pickup"]),"dropoff":tuple(data["dropoff"]),
+                           "via":tuple(tuple(point) for point in data.get("via", ()))})
             for value in (route.id,route.hub,route.spoke):
                 if not isinstance(value,str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}",value):
                     raise ValueError("站点或航段编号格式无效")
             if (route.id in labels or not isfinite(route.km) or not rules.leg_min <= route.km <= rules.leg_max
                     or not all(len(point)==2 and all(isfinite(x) for x in point)
-                               for point in (route.pickup,route.dropoff))):
+                               for point in (route.pickup, *route.via, route.dropoff))):
                 raise ValueError("航段重复或几何数据无效")
             routes.append(route)
             labels.add(route.id)
@@ -171,7 +173,7 @@ class Network:
         candidates = tuple({**point, "location": tuple(point["location"])} if "location" in point else point
                            for point in row.get("candidates", ()))
         result = cls(origin, bounds, tuple(routes), candidates, row.get("diagnostics"), starts, rules)
-        if any(not result.contains(point) for route in routes for point in (route.pickup,route.dropoff)):
+        if any(not result.contains(point) for route in routes for point in (route.pickup, *route.via, route.dropoff)):
             raise ValueError("航段端点位于航网范围之外")
         return result
 

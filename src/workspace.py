@@ -38,6 +38,7 @@ class ManualRecord:
     chosen_mode: str
     delivered_at: str | None = None
     chosen_route_id: str | None = None
+    reservation: dict | None = None
 
     def __post_init__(self):
         if not MANUAL_ID.fullmatch(self.order.id) or not SOURCE_ID.fullmatch(self.source):
@@ -73,6 +74,19 @@ class ManualRecord:
             arrival = datetime.fromisoformat(self.delivered_at)
             if arrival.tzinfo is not None or arrival < ordered_at:
                 raise ValueError("送达时间不能早于下单时间")
+        if self.reservation is not None:
+            plan = json.loads(encode(self.reservation))
+            if plan.get("mode") != self.chosen_mode or plan.get("route") != self.chosen_route_id:
+                raise ValueError("资源预约必须对应确认方案")
+            if not 1 <= len(plan["slots"]) <= 3:
+                raise ValueError("资源预约条目数无效")
+            for slot in plan["slots"]:
+                if (slot["order"] != order.id or not re.fullmatch(r"(?:rider|aircraft):[A-Za-z0-9_-]+:\d+",
+                                                                 slot["resource"])
+                        or not isinstance(slot["start"], int) or not isinstance(slot["end"], int)
+                        or slot["start"] >= slot["end"]):
+                    raise ValueError("资源预约时间或编号无效")
+            object.__setattr__(self, "reservation", plan)
 
     @classmethod
     def from_dict(cls, row):
@@ -95,6 +109,39 @@ class ManualStore:
 
     def confirm(self, record):
         self.merge((record,))
+
+    @staticmethod
+    def _scope(connection, source, version):
+        rows = connection.execute("SELECT body FROM manual_orders WHERE source=? ORDER BY id", (source,))
+        records = [body for (body,) in rows if json.loads(body)["network_version"] == version]
+        revision = sha256(encode(records).encode("utf-8")).hexdigest()
+        return records, revision
+
+    def confirmed_state(self, source, version):
+        with closing(sqlite3.connect(self.path)) as connection:
+            rows, revision = self._scope(connection, source, version)
+        return [ManualRecord.from_dict(json.loads(body)) for body in rows], revision
+
+    def confirm_plans(self, records, source, version, expected):
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            saved, revision = self._scope(connection, source, version)
+            if revision != expected:
+                raise ValueError("已有订单或资源状态变更，请重新计算")
+            reservations = {}
+            for plan in [json.loads(body).get("reservation") for body in saved] + [row.reservation for row in records]:
+                if plan:
+                    for slot in plan["slots"]:
+                        reservations.setdefault(slot["resource"], []).append((slot["start"], slot["end"]))
+            for intervals in reservations.values():
+                intervals.sort()
+                if any(end > start for (_, end), (start, _) in zip(intervals, intervals[1:])):
+                    raise ValueError("配送计划出现资源预约冲突，请重新计算")
+            for row in records:
+                if row.source != source or row.network_version != version or not row.reservation:
+                    raise ValueError("确认订单与当前航网或运力预约不符")
+                connection.execute("INSERT INTO manual_orders VALUES (?,?,?,?)",
+                                   (row.order.id, source, row.ordered_at, encode(asdict(row))))
 
     def complete(self, order_id, delivered_at):
         with closing(sqlite3.connect(self.path)) as conn, conn:

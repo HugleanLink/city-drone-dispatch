@@ -83,10 +83,10 @@ def prepare(source, mapping=None, encoding="utf-8-sig"):
     date_pre, date_drive = (fetch_date-paid_date).dt.days, (arrived_date-fetch_date).dt.days
     pre = (f-df.minute + date_pre*1440).where(date_pre.notna(), pre)
     drive = (a-f + date_drive*1440).where(date_drive.notna(), drive)
-    reference = (pre >= 0) & (drive >= 0) & ((pre + drive) <= 180)
+    reference = pre.between(0, 120) & drive.between(0, 180)
     df["reference_minutes"] = drive.where(reference).astype(float)
     df["pre_pickup"] = pre.where(reference).astype(float)
-    reference_late = int((valid & ((pre + drive) > 180)).sum())
+    reference_late = int((valid & ((pre > 120) | (drive > 180))).sum())
     reference_invalid = int((valid & ~reference.fillna(False)).sum())
     active = valid & ~duplicated & df.minute.between(START, LAST_ARRIVAL-1)
     if not active.any():
@@ -104,7 +104,7 @@ def prepare(source, mapping=None, encoding="utf-8-sig"):
         raise ValueError("请选择同一模拟城区内的坐标范围")
     report = {"输入": total, "坐标异常": int((~coords).sum()), "时间异常": int(df.minute.isna().sum()),
               "业务异常": int((~supported).sum()), "价格异常": int((~price_ok).sum()),
-              "重复": int(duplicated.sum()), "参考时长超过180分钟": reference_late,
+              "重复": int(duplicated.sum()), "参考时长超过分段上限": reference_late,
               "参考时刻缺失或异常": reference_invalid, "窗口内可用": int(active.sum()),
               "按日组": {str(k):int(v) for k,v in df.loc[active].group.value_counts().items()}}
     return Profile(rows, tuple(float(x) for x in origin), report)

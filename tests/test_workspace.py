@@ -122,7 +122,7 @@ def test_manual_source_split_uses_each_input_record_at_most_once():
     assert len(planning_sample(plan, 3)) == 3
 
 
-def test_planning_day_change_updates_operation_range_and_builds_from_selected_days(monkeypatch):
+def test_build_uses_only_selected_historical_day_groups(monkeypatch):
     entrypoint = Path(__file__).resolve().parents[1] / "streamlit_app.py"
     header = b"pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,customer_pay_time,fetch_time,arrived_time,dt_seq_id\n"
     rows = "".join(f"35.68,139.75,35.69,139.77,12:00,12:05,12:19,{day}\n" for day in range(1, 8))
@@ -131,21 +131,12 @@ def test_planning_day_change_updates_operation_range_and_builds_from_selected_da
     monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload)
     app = AppTest.from_file(entrypoint, default_timeout=20).run()
 
-    def number(label):
-        return next(widget for widget in app.number_input if widget.label == label)
-
-    assert number("规划航网使用结束日").value == 4
-    assert number("模拟运营使用起始日").value == 5
-    number("规划航网使用结束日").set_value(3).run()
-    assert number("模拟运营使用起始日").value == 4
-    assert number("模拟运营使用结束日").value == 7
-    number("Hub 数量上限（0 为不限）").set_value(0).run()
-    number("接驳站数量上限（0 为不限）").set_value(0).run()
+    next(widget for widget in app.multiselect if widget.label == "历史日组").set_value(["1", "2", "3"]).run()
     next(widget for widget in app.button if widget.label == "分析并构建航网").click().run()
     assert not app.exception
-    assert app.session_state.network.diagnostics["planning"] == 3
-    assert app.session_state.network.routes
-    assert set(app.session_state.operation_profile.rows.group) == {"4", "5", "6", "7"}
+    assert app.session_state.network.diagnostics["screened_orders"] == 3
+    assert set(app.session_state.operation_profile.rows.group) == {"1", "2", "3"}
+    assert len(app.session_state.ground_model.quantiles) == 24
 
 
 def test_single_page_manual_delivery(monkeypatch):
@@ -165,15 +156,15 @@ def test_single_page_manual_delivery(monkeypatch):
     assert not {"字段映射与编码", "工作区备份与恢复", "导入多日对照结果", "查看共同输入哈希"} & {
         expander.label for expander in app.expander
     }
-    next(box for box in app.checkbox if box.label == "使用全部规划来源").check().run()
-    next(widget for widget in app.number_input if widget.label == "包裹最大重量 kg").set_value(1.05).run()
+    next(box for box in app.checkbox if box.label == "使用所选日组的全部订单").check().run()
+    next(widget for widget in app.number_input if widget.label == "无人机最大载重 kg").set_value(.95).run()
     next(widget for widget in app.button if widget.label == "分析并构建航网").click().run()
     assert not app.exception
     net = app.session_state.network
-    assert net.diagnostics["planning"] == 6
-    assert net.diagnostics["potential"] == 0
-    assert net.rules.weight == 1.05 and Network.from_dict(asdict(net)) == net
-    assert any(heading.value == "配送效率对照" for heading in app.subheader)
+    assert net.diagnostics["screened_orders"] == 6
+    assert net.rules.weight == .95 and Network.from_dict(asdict(net)) == net
+    assert any(heading.value == "订单调度" for heading in app.subheader)
+    assert all(heading.value != "配送效率对照" for heading in app.subheader)
     assert any(expander.label == "运力配置" for expander in app.sidebar.expander)
 
     def button(label):
@@ -181,9 +172,10 @@ def test_single_page_manual_delivery(monkeypatch):
 
     button("计算配送建议").click().run()
     assert not app.exception
-    assert app.session_state.draft["result"]["mode"] == "ground"
-    button("确认送单方式").click().run()
-    assert app.session_state.manual_store.list()[0].source == app.session_state.profile_key
+    assert app.session_state.draft["plans"][0].mode == "ground"
+    button("确认可执行配送方案").click().run()
+    original = app.session_state.manual_store.list()[0]
+    assert original.source == app.session_state.profile_key and original.reservation
     assert button("登记实际送达").disabled
     next(widget for widget in app.time_input if widget.label == "实际送达时间").set_value(time(12, 28)).run()
     button("登记实际送达").click().run()
@@ -191,12 +183,13 @@ def test_single_page_manual_delivery(monkeypatch):
     assert len(app.session_state.manual_store.list()) == 1
     assert app.session_state.manual_store.list()[0].delivered_at.endswith("T12:28")
 
-    widget = next(item for item in app.number_input if item.label == "本轮仿真订单数")
-    widget.set_value(3).run()
-    button("运行配送效率对照").click().run()
-    app.session_state.batch["future"].result(timeout=10)
-    app.run()
+    button("录入下一批").click().run()
+    widget = next(item for item in app.number_input if item.label == "本次录入订单数")
+    widget.set_value(10).run()
+    button("计算联合调度").click().run()
     assert not app.exception
-    assert len(app.session_state.batch["rows"]) == 4
-    assert all(row["arrivals"] == 3 for row in app.session_state.batch["rows"])
-    assert any("单均节省（分钟）" in frame.value.columns for frame in app.dataframe)
+    assert len(app.session_state.draft["plans"]) == 10
+    assert not app.session_state.draft["report"]["fallback"]
+    button("确认可执行配送方案").click().run()
+    records = app.session_state.manual_store.list()
+    assert len(records) == 11 and len({record.order.id for record in records}) == 11

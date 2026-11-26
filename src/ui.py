@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+from math import isfinite
 import tempfile
 from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from queue import Empty, SimpleQueue
-from threading import Event
 from uuid import uuid4
 
 import folium
@@ -17,14 +15,14 @@ import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 
-from .batch import DISTURBANCES, Disturbance, adjust_demand, digest, run_batch
-from .calibration import fit
-from .diagnostics import MODE_STAGES, NON_ADDITIVE, STAGES, diagnostic_tables
-from .efficiency import fleet_estimate, operating_settings
-from .data import day_groups, generate, new_order, prepare, profile_for_groups, rng, source_counts, split_sources
-from .model import BUSINESS, MODES, STRATEGIES, FlightRules, match_order
-from .storage import encode
-from .workspace import ManualRecord, ManualStore, construct, manual_preview
+from .batch import digest
+from .speed import fit_hourly
+from .data import day_groups, planning_sample, prepare, profile_for_groups
+from .model import BUSINESS, MODES, Order
+from .workspace import ManualRecord, ManualStore
+from .cli import profile_extent
+from .deployment import deploy
+from .operations import MAX_ORDERS, Dispatcher, grounds_used, joint, operating_cost, saved_schedule, staff_estimate
 
 ROOT = Path(__file__).resolve().parents[1]
 CLOUD = os.environ.get("DRONE_DISPATCH_MODE") != "local"
@@ -52,11 +50,6 @@ STYLE = """
 """
 
 
-@st.cache_resource
-def worker_pool():
-    return ThreadPoolExecutor(max_workers=2, thread_name_prefix="dispatch")
-
-
 def clock(value):
     return value.hour * 60 + value.minute
 
@@ -81,7 +74,7 @@ def activate(network, source, label, operation_profile, ground_model):
     s.network_version = digest(asdict(network))
     s.source = source
     s.source_label = label
-    s.disturbance = None
+    s.default_staff = staff_estimate(operation_profile)
     s.draft = None
     s.map_click = None
     s.map_revision = s.get("map_revision", 0) + 1
@@ -102,199 +95,55 @@ def initialize():
 
 def planning_settings():
     with st.sidebar.expander("建网参数"):
-        weight = st.number_input("包裹最大重量 kg", min_value=.01, value=2., step=.1)
-        order_min = st.number_input("最短取送直线距离 km", min_value=0., value=1., step=.1)
-        order_max = st.number_input("最长取送直线距离 km", min_value=.01, value=4.04, step=.1)
-        access = st.number_input("每端最大直线接驳距离 km", min_value=.01, value=3., step=.1)
-        leg_min = st.number_input("最短 Hub–接驳站航段 km", min_value=.01, value=.5, step=.1)
-        leg_max = st.number_input("最长 Hub–接驳站航段 km", min_value=.01, value=6.06, step=.1)
-        hubs = st.number_input("Hub 数量上限（0 为不限）", min_value=0, value=15, step=1)
-        spokes = st.number_input("接驳站数量上限（0 为不限）", min_value=0, value=10, step=1)
-        corridors = st.number_input("可调度航段数量上限（0 为不限）", min_value=0, value=0, step=1)
-        eps = st.number_input("DBSCAN 邻域半径 km（0 为自动）", min_value=0., value=0., step=.05)
-        minimum = st.number_input("DBSCAN 最小样本数（0 为自动）", min_value=0, value=0, step=1)
-        exclude = st.checkbox("拼好饭仅走地面", value=True)
-        st.caption("订单距离与接驳半径按直线计算。CSV 没有重量时，使用按业务类型生成的重量。站点候选来自上传 CSV 的取送点。")
-    rules = dict(weight=weight, order_min=order_min, order_max=order_max, access_km=access,
-                 leg_min=leg_min, leg_max=leg_max, report=True, exclude_group_meal=exclude)
-    settings = dict(max_hubs=hubs or None, max_spokes=spokes or None, max_routes=corridors or None,
-                    eps=eps or None, minimum=minimum or None)
-    return rules, settings
+        hubs = st.number_input("贪心 Hub 数量上限", 1, 50, 15)
+        radius = st.number_input("两端直线接驳半径 km", min_value=.1, value=3., step=.1)
+        weight = st.number_input("无人机最大载重 kg", min_value=.1, value=2., step=.1)
+    return dict(max_hubs=hubs, radius=radius, weight=weight)
 
 
-def day_ranges(group_count, source):
-    start_key, end_key, op_start_key, op_end_key = (f"{source}_{part}" for part in
-                                                   ("plan_start", "plan_end", "op_start", "op_end"))
-    state = st.session_state
-
-    def set_operation_range():
-        if state[end_key] < group_count:
-            state[op_start_key], state[op_end_key] = state[end_key] + 1, group_count
-        elif state[start_key] > 1:
-            state[op_start_key], state[op_end_key] = 1, state[start_key] - 1
-
-    def range_fields(label, first_key, last_key, first, last, on_change=None):
-        title, start, separator, end, unit = st.columns([2, 1, .25, 1, .4], vertical_alignment="center")
-        title.write(label)
-        separator.write("–")
-        unit.write("日")
-        lower = start.number_input(label + "起始日", 1, group_count, first, key=first_key,
-                                   label_visibility="collapsed", on_change=on_change)
-        upper = end.number_input(label + "结束日", 1, group_count, last, key=last_key,
-                                 label_visibility="collapsed", on_change=on_change)
-        return lower, upper
-
-    default_end = max(1, min(4, group_count - 1))
-    plan = range_fields("规划航网使用", start_key, end_key, 1, default_end, set_operation_range)
-    operation = range_fields("模拟运营使用", op_start_key, op_end_key, min(default_end + 1, group_count), group_count)
-    return plan, operation
-
-
-def data_panel(rules, settings):
+def data_panel(settings):
     s = st.session_state
     st.subheader("导入与建网")
-    upload = st.file_uploader("导入运行数据", type=["csv", "gz"], key="data_file",
-                              help="大文件可先压缩为 CSV.GZ，以减少传输时间。")
+    upload = st.file_uploader("导入历史运营数据", type=["csv", "gz"], key="data_file")
     if not upload:
-        s.upload_token = None
-        s.profile = s.profile_key = None
         if not s.network:
-            st.info("上传 CSV 或 CSV.GZ 后可划分数据并构建航网。")
+            st.info("上传 CSV 或 CSV.GZ 后，选择用于规划与估时的历史订单。")
         return
     if s.get("upload_token") != upload.file_id:
         s.upload_token = upload.file_id
         s.upload_error = None
         try:
-            with st.spinner("校验 CSV 并统计有效订单…"):
+            with st.spinner("校验历史订单…"):
                 payload = upload.getvalue()
                 fingerprint = hashlib.sha256(payload).hexdigest()
-                if s.profile is None or s.profile_key != fingerprint:
-                    try:
-                        profile = prepare(payload)
-                    except UnicodeDecodeError:
-                        profile = prepare(payload, encoding="gb18030")
-                    s.profile, s.profile_key = profile, fingerprint
-                    s.profile_counts = source_counts(profile)
+                try:
+                    profile = prepare(payload)
+                except UnicodeDecodeError:
+                    profile = prepare(payload, encoding="gb18030")
+                s.profile, s.profile_key = profile, fingerprint
         except DATA_ERRORS as error:
             s.upload_error = f"导入失败 · {error}"
     if s.upload_error:
         st.error(s.upload_error)
         return
     profile = s.profile
-    total = profile.report["窗口内可用"]
-    planning, operation = s.profile_counts["planning"], s.profile_counts["operation"]
-    manual_split = False
-    if total >= 2:
-        split = st.radio("数据来源划分", ("按日组划分", "手动指定来源数量"), horizontal=True)
-        manual_split = split == "手动指定来源数量"
-    if manual_split:
-        first, second = st.columns(2)
-        planning = first.number_input("规划来源数量", 1, total - 1, min(planning, total - 1),
-                                      key=f"planning_source_{s.profile_key}")
-        operation = second.number_input("运营来源数量", 1, total - 1, min(operation, total - planning),
-                                        key=f"operation_source_{s.profile_key}")
-        valid = planning + operation <= total
-        if valid:
-            st.caption(f"两组不重叠，有 {total - planning - operation:,} 条不使用")
-        else:
-            st.error("规划与运营来源数量之和不能超过有效订单数。")
-    else:
-        groups = day_groups(profile)
-        (plan_first, plan_last), (op_first, op_last) = day_ranges(len(groups), s.profile_key)
-        valid = plan_first <= plan_last and op_first <= op_last
-        if not valid:
-            st.error("起始日须早于或等于结束日。")
-        elif len(groups) > 1 and not (plan_last < op_first or op_last < plan_first):
-            valid = False
-            st.error("规划和运营的日期范围不能重叠。")
-        plan_days, operation_days = groups[plan_first-1:plan_last], groups[op_first-1:op_last]
-        planning = sum(profile.report["按日组"][day] for day in plan_days)
-        if len(groups) == 1:
-            st.caption("文件只有一个有效日组。可用手动指定来源数量来拆分同日订单。")
-    use_all = st.checkbox("使用全部规划来源")
-    count = None if use_all else st.number_input("规划订单数", min_value=1, value=max(1, min(4_000, planning)),
-                                                key=f"planning_count_{s.profile_key}_{planning}")
-    if valid and count is not None and count > planning:
-        st.error("规划订单数不能超过规划来源数量。")
-        valid = False
-    include = st.checkbox("纳入已完成的新单", value=True, key="include_manual")
-    if st.button("分析并构建航网", type="primary", disabled=not valid):
+    groups = day_groups(profile)
+    selected = st.multiselect("历史日组", groups, default=groups, key=f"history_{s.profile_key}")
+    available = sum(profile.report["按日组"][day] for day in selected)
+    use_all = st.checkbox("使用所选日组的全部订单", key=f"full_{s.profile_key}")
+    count = (None if use_all else st.number_input("建网抽样上限", 1, max(1, available),
+                                                 min(4_000, max(1, available)), key=f"count_{s.profile_key}_{available}"))
+    if st.button("分析并构建航网", type="primary", disabled=not selected):
         try:
-            with st.spinner(f"正在分析 {planning if count is None else count:,} 条规划订单并构建航网…"):
-                if manual_split:
-                    plan_pool, operation_pool = split_sources(profile, planning, operation)
-                else:
-                    plan_pool = profile_for_groups(profile, plan_days)
-                    operation_pool = profile_for_groups(profile, operation_days)
-                ground_model = fit(plan_pool)
-                network = construct(plan_pool, s.manual_store.list(), s.profile_key, count, include,
-                                    no_replacement=True, rules=FlightRules(**rules), **settings)
-            activate(network, s.profile_key, upload.name[:255], operation_pool, ground_model)
-            returned = network.diagnostics["returned_orders"]
-            st.success(f"已启用新航网 · {len(network.routes)} 条可调度航段 · 纳入 {returned} 条已完成新单")
+            with st.spinner("拟合距离与分时估时，搜索航网部署方案…"):
+                pool = profile_for_groups(profile, selected)
+                orders = planning_sample(pool, count)
+                network = deploy(orders, pool.origin, profile_extent(pool), **settings)
+                ground_model = fit_hourly(pool)
+            activate(network, s.profile_key, upload.name[:255], pool, ground_model)
+            st.success(f"已启用新航网 · {len(network.routes)} 条可调度路径")
         except DATA_ERRORS as error:
             st.error(f"建网失败 · {error}")
-
-
-def station_labels(network):
-    labels = {}
-    for route in network.routes:
-        labels[route.hub_site or route.hub] = route.hub
-        labels[route.spoke_site or route.spoke] = route.spoke
-    return labels
-
-
-def disturbance_panel():
-    s = st.session_state
-    with st.sidebar:
-        st.header("扰动调整")
-        options = [None, *DISTURBANCES]
-        current = s.disturbance
-        kind = st.selectbox("调整对象", options, index=options.index(current.kind) if current else 0,
-                            format_func=lambda k: DISTURBANCES[k] if k else "无扰动",
-                            key=f"disturbance_kind_{s.map_revision}")
-        if kind is None:
-            if current and st.button("恢复无扰状态", width="stretch"):
-                s.disturbance = None
-        else:
-            labels = station_labels(s.network)
-            sites = ([""] if kind == "demand" else sorted(labels) if kind == "pad"
-                     else sorted({route.hub for route in s.network.routes}))
-            if not sites:
-                st.info("当前航网没有可调整的站点。")
-            else:
-                with st.form(f"disturbance_{s.map_revision}_{kind}"):
-                    same = current if current and current.kind == kind else None
-                    if kind == "demand":
-                        site = ""
-                        st.caption("订单量调整用于下方的运营对照。")
-                    else:
-                        site = st.selectbox("目标站点", sites, index=sites.index(same.site) if same and same.site in sites else 0,
-                                            format_func=lambda value: labels.get(value, value))
-                    limits = (-100, 200) if kind == "demand" else (1, 100)
-                    percent = st.number_input("订单量变化 (%)" if kind == "demand" else "停用比例 (%)",
-                                              *limits, same.percent if same else 50, step=1)
-                    start_time = time(same.start // 60, same.start % 60) if same else time(12)
-                    last = same.end % 1440 if same else 740
-                    start = st.time_input("开始时间", start_time, step=60)
-                    end = st.time_input("结束时间", time(last // 60, last % 60), step=60)
-                    if st.form_submit_button("应用扰动", type="primary", width="stretch"):
-                        try:
-                            begin, finish = clock(start), clock(end)
-                            if finish < begin:
-                                finish += 1440
-                            s.disturbance = Disturbance(kind, site, percent, begin, finish)
-                        except ValueError as error:
-                            st.error(str(error))
-        if s.disturbance:
-            d = s.disturbance
-            location = station_labels(s.network).get(d.site, d.site)
-            st.success(f"已应用 {DISTURBANCES[d.kind]} {location} · {d.percent}% · {hhmm(d.start)}–{hhmm(d.end)}")
-            if kind and st.button("清除扰动", width="stretch"):
-                s.disturbance = None
-                st.rerun()
-        else:
-            st.caption("当前无扰动。")
 
 
 def map_panel(defaults):
@@ -305,41 +154,52 @@ def map_panel(defaults):
     corridors = diag.get("hub_corridors", [])
     hubs = len({site["id"] for site in network.candidates if site["active"] and site["role"] == "Hub"}
                | {route.hub for route in network.routes})
-    spokes = len({route.spoke for route in network.routes})
+    spokes = len({route.spoke for route in network.routes}
+                 | {site["id"] for site in network.candidates if site["active"] and site["role"] == "Spoke"})
     st.caption(f"{hubs} 个 Hub、{spokes} 个 Spoke、{len(network.routes)} 条航段")
+    if diag.get("distance_window"):
+        low, high = diag["distance_window"]
+        st.caption(f"适飞距离 {low:.2f}–{high:.2f} km · {diag.get('candidate_method', '未形成候选站点')}"
+                   + (" · 使用备用距离区间" if diag["distance_fallback"] else ""))
+        with st.expander("航网目标与地面估时"):
+            if objectives := diag.get("deployment_objectives"):
+                cost, lost, ground = objectives
+                st.write(f"综合部署方案 · 样本成本 {cost:,.0f} 元 · "
+                         f"价值加权损失率 {lost:.1%} · 地面依赖度 {ground:.1%}")
+            st.dataframe([{"出发时段": f"{i:02d}:00", "P50（分钟/km）": round(p50, 2),
+                           "P90（分钟/km）": round(p90, 2), "GMM 分量": detail["components"],
+                           "拟合样本": detail["samples"]}
+                          for i, ((p50, p90), detail) in enumerate(zip(s.ground_model.quantiles,
+                                                                     s.ground_model.diagnostics))],
+                         hide_index=True)
     if not network.routes:
         st.info("规划订单未形成满足载重、航程与两端接驳条件的航段，地面配送仍可计算。")
     show_corridors = bool(corridors) and st.checkbox(
         "显示 Hub 间规划走廊",
-        help="紫色虚线连接两个 Hub，供规划时查看中转通道。红线连接 Hub 和 Spoke，用于当前订单的空地接驳调度。")
+        help="紫色虚线为已启用的 Hub 间走廊。红线为调度可用的 Hub–Spoke 路径。")
     if not network.routes and diag.get("screened_out"):
         st.caption("初筛排除 · " + "；".join(f"{reason}：{count:,} 单" for reason, count in diag["screened_out"].items()))
     target = st.radio("地图点击设置", ("取货点", "目的地"), horizontal=True)
     prefix = f"point_{s.map_revision}_"
-    d = s.disturbance
     base_map = folium.Map(location=network.origin, zoom_start=13, tiles="OpenStreetMap", control_scale=True)
     left, right, bottom, top = network.bounds
     base_map.fit_bounds([network.latlon(left, bottom), network.latlon(right, top)])
     layers = folium.FeatureGroup(name="航网与新单")
-    is_resource = d and d.kind != "demand"
     sites = {}
     for corridor in corridors if show_corridors else ():
         folium.PolyLine([corridor["start"], corridor["end"]], color="#725296", weight=2, dash_array="5 6",
                         tooltip=f"{corridor['id']} · Hub 间规划走廊 · {corridor['km']:.2f} km").add_to(layers)
     for route in network.routes:
-        endpoints = {route.hub_site or route.hub, route.spoke_site or route.spoke}
-        affected = is_resource and (d.site in endpoints if d.kind == "pad" else d.site == route.hub)
-        folium.PolyLine([route.pickup, route.dropoff], color="#c7212a",
-                        weight=2, opacity=.68 if affected else .42, dash_array="6 4" if affected else None,
-                        tooltip=f"{route.id} · {route.km:.2f} km" + (" · 运力受限" if affected else "")).add_to(layers)
-        sites[route.hub] = (route.pickup, "Hub", is_resource and (d.site in (route.hub_site, route.hub)))
-        sites[route.spoke] = (route.dropoff, "接驳站", is_resource and d.site in (route.spoke_site, route.spoke))
+        folium.PolyLine([route.pickup, *route.via, route.dropoff], color="#c7212a",
+                        weight=2, opacity=.42, tooltip=f"{route.id} · {route.km:.2f} km").add_to(layers)
+        sites[route.hub] = (route.pickup, "Hub")
+        sites[route.spoke] = (route.dropoff, "Spoke")
     for site in network.candidates:
-        if site["active"] and site["role"] == "Hub":
-            sites.setdefault(site["id"], (site["location"], "Hub", False))
-    for name, (point, role, affected) in sites.items():
-        outline = "#c46a27" if affected else "#394352"
-        tooltip = f"{role} {name}" + (" · 受限" if affected else "")
+        if site["active"]:
+            sites.setdefault(site["id"], (site["location"], site["role"]))
+    for name, (point, role) in sites.items():
+        outline = "#394352"
+        tooltip = f"{role} {name}"
         if role == "Hub":
             marker = folium.CircleMarker(point, radius=7, color=outline, weight=2,
                                          fill=True, fill_color="#ffdb44", fill_opacity=1, tooltip=tooltip)
@@ -361,115 +221,178 @@ def map_panel(defaults):
         st.rerun()
 
 
-def result_panel(draft):
-    normal, result = draft["normal"], draft["result"]
-    mode = result["mode"]
-    st.markdown(f'<div class="decision"><small>推荐方式</small><strong>{MODES[mode]}</strong></div>',
-                unsafe_allow_html=True)
-    cards = "".join(f'<div class="eta-cell"><span>{label}</span><strong>{hhmm(result[key])}</strong></div>'
-                    for label, key in (("地面直送", "ground_eta"), ("空地接驳", "air_eta"), ("预计备妥", "ready")))
-    st.markdown(f'<div class="eta-strip">{cards}</div>', unsafe_allow_html=True)
-    st.caption(f"地面 · {result['ground_reason']}　｜　空地 · {result['air_reason']}")
-    air_route = result.get("air_route_id")
-    preferred = result.get("preferred_route_id")
-    if preferred:
-        st.caption(f"空间首选 {preferred} · {len(result['candidate_route_ids'])} 条候选"
-                   + (f" · 空地 ETA 对应 {air_route}" if air_route else ""))
-    branches = {item["mode"]: item for item in result["branches"]}
-    winner = branches.get(mode)
-    other = branches.get({"ground": "air", "air": "ground"}.get(mode))
-    if mode == "wait":
-        st.write("等待复核。后续有资源可用时重新评估。")
-    elif other and winner["total_minutes"] < other["total_minutes"]:
-        st.write("推荐方式的预计配送总耗时更短。")
-    else:
-        st.write("推荐方式可按当前共享运力安排。")
-    if draft["disturbance"] and draft["disturbance"].kind != "demand":
-        st.dataframe([{"条件": title, "推荐方式": MODES[guide["mode"]],
-                       "地面 ETA": hhmm(guide["ground_eta"]), "空地 ETA": hhmm(guide["air_eta"]),
-                       "空地航段": guide.get("air_route_id")}
-                      for title, guide in (("无扰动", normal), ("当前扰动", result))],
-                     hide_index=True, width="stretch")
-    if result["branches"]:
-        with st.expander("查看试排依据"):
-            st.dataframe([{"分支": MODES[branch["mode"]], "本单 ETA": hhmm(branch["eta"]),
-                           "试排航段": branch.get("route_id"),
-                           "预计完成数": branch["completed"], "预计总耗时（分钟）": branch["total_minutes"]}
-                          for branch in result["branches"]], hide_index=True, width="stretch")
+def guide_for(job, ground, air, chosen):
+    midnight = job.arrival - job.order.arrival
+    eta = lambda plan: plan.eta - midnight if plan else None
+    return {"mode": chosen.mode if chosen else "wait", "ground_eta": eta(ground), "air_eta": eta(air),
+            "preferred_route_id": job.order.route_id, "air_route_id": air.route if air else None,
+            "ready": job.ready - midnight}
 
 
-def order_panel(defaults, settings):
+def output_rows(jobs, plans, routes):
+    rows = []
+    for job, plan in zip(jobs, plans):
+        midnight = job.arrival - job.order.arrival
+        rows.append({"订单": job.order.id[:12], "下单": job.ordered_at.replace("T", " "),
+                     "方式": MODES[plan.mode] if plan else "待分配",
+                     "航段": plan.route if plan else None, "预计送达": hhmm(plan.eta - midnight) if plan else "—",
+                     "端到端（分钟）": plan.eta - job.arrival if plan else None,
+                     "骑手占用（分钟）": grounds_used(plan) if plan else None,
+                     "预计成本（元）": round(operating_cost(plan, routes), 2) if plan else None})
+    return rows
+
+
+def render_reservations(jobs, plans):
+    with st.expander("配送与资源明细"):
+        for job, plan in zip(jobs, plans):
+            if not plan:
+                continue
+            midnight = job.arrival - job.order.arrival
+            st.write(job.order.id[:12])
+            if plan.air_times:
+                hub, launch, parcel, handoff = plan.air_times
+                st.caption(f"Hub 交接 {hhmm(hub-midnight)} · 起飞 {hhmm(launch-midnight)} · "
+                           f"Spoke 可取 {hhmm(parcel-midnight)} · 末段取货 {hhmm(handoff-midnight)}")
+            st.dataframe([{"资源": slot.resource, "任务": slot.activity, "开始": hhmm(slot.start-midnight),
+                           "结束": hhmm(slot.end-midnight)} for slot in plan.slots], hide_index=True)
+
+
+def order_panel(defaults, riders, fleet):
     s = st.session_state
-    st.subheader("新单配送建议")
+    st.subheader("订单调度")
+    revision = f"{s.map_revision}_{s.get('order_revision', 0)}"
+    number = st.number_input("本次录入订单数", 1, MAX_ORDERS, 1, key=f"count_{revision}")
+    day = st.date_input("下单日期", today(), key=f"day_{revision}")
+    threshold = st.number_input("单笔采用空地的最小节时（分钟）", 0, 60, 0, key=f"threshold_{revision}")
+    fields = ("取货纬度", "取货经度", "送达纬度", "送达经度")
     prefix = f"point_{s.map_revision}_"
-    options = list(BUSINESS)
-    date_col, time_col = st.columns(2)
-    day = date_col.date_input("下单日期", today(), key=f"day_{s.map_revision}")
-    when = time_col.time_input("下单时间", time(12), step=60, key=f"time_{s.map_revision}")
-    with st.expander("取送坐标与订单参数"):
-        coords = []
-        for col, (key, label, point) in zip(st.columns(2), (
-                ("pickup", "取货点", defaults[0]), ("dropoff", "目的地", defaults[1]))):
-            lat_key, lon_key = prefix + key + "0", prefix + key + "1"
-            s.setdefault(lat_key, point[0])
-            s.setdefault(lon_key, point[1])
-            lat = col.number_input(f"{label}纬度", min_value=-90., max_value=90., format="%.7f", key=lat_key)
-            lon = col.number_input(f"{label}经度", min_value=-180., max_value=180., format="%.7f", key=lon_key)
-            coords.append((lat, lon))
-        business = st.selectbox("业务类型", options, format_func=lambda kind: BUSINESS[kind][0])
-        weight = st.number_input("包裹重量 kg（0 为业务默认）", min_value=0., max_value=1000., step=.1)
-    st.caption("在地图上选择取货点和目的地，也可填写坐标。")
-    ordered_at = datetime.combine(day, when).isoformat(timespec="minutes")
-    signature = digest([ordered_at, coords, business, weight, s.source, s.network_version, settings, s.ground_model.version])
-    draft = s.draft
+    points = [s.get(prefix + name + str(k), fallback[k])
+              for name, fallback in zip(("pickup", "dropoff"), defaults) for k in range(2)]
+    businesses = {info[0]: code for code, info in BUSINESS.items()}
+    if number == 1:
+        when = st.time_input("下单时间", time(12), step=60, key=f"time_{revision}")
+        with st.expander("取送坐标与订单参数"):
+            cols = st.columns(2)
+            for i, (label, point) in enumerate(zip(fields, points)):
+                key = prefix + ("pickup", "dropoff")[i // 2] + str(i % 2)
+                s.setdefault(key, point)
+                limit = 90. if i % 2 == 0 else 180.
+                points[i] = cols[i // 2].number_input(label, -limit, limit, format="%.7f", key=key)
+            business = st.selectbox("业务类型", list(businesses), key=f"business_{revision}")
+            kg = st.number_input("包裹重量 kg", min_value=.01, value=1., step=.1, key=f"kg_{revision}")
+            price = st.number_input("订单价格（元）", min_value=0., value=None, step=.1, key=f"price_{revision}")
+        inputs = [{"下单时间": when.strftime("%H:%M"), **dict(zip(fields, points)),
+                   "业务": business, "重量 kg": kg, "价格": price}]
+    else:
+        base = {"下单时间": "12:00", **dict(zip(fields, points)), "业务": "外卖", "重量 kg": 1., "价格": None}
+        frame = pd.DataFrame([base] * number).astype({"价格": "Float64"})
+        edited = st.data_editor(frame, key=f"orders_{revision}_{number}", hide_index=True,
+                                column_config={"业务": st.column_config.SelectboxColumn(options=list(businesses), required=True),
+                                               "重量 kg": st.column_config.NumberColumn(min_value=.01, required=True),
+                                               "价格": st.column_config.NumberColumn(min_value=0.),
+                                               **{field: st.column_config.NumberColumn(format="%.7f", required=True)
+                                                  for field in fields}})
+        inputs = edited.astype(object).where(pd.notna(edited), None).to_dict("records")
+    input_key = digest([day.isoformat(), inputs, s.network_version])
+    signature = digest([input_key, riders, fleet, threshold])
+    draft = s.get("draft")
     same = draft and draft["signature"] == signature
-    requested = st.button("计算配送建议", type="primary", width="stretch",
-                          disabled=bool(same and draft["confirmed"]))
-    if requested or (same and not draft["confirmed"] and draft["disturbance"] != s.disturbance):
+    recorded = bool(draft and draft.get("input_key") == input_key and draft["confirmed"])
+    retry = recorded and bool(draft["pending"])
+    if st.button("重算剩余订单" if retry else "计算配送建议" if number == 1 else "计算联合调度",
+                 type="primary", disabled=recorded and not retry):
         try:
-            order_id = draft["order"].id if same else "M-" + uuid4().hex
-            order = new_order(order_id, clock(when), *coords, business, rng(int(signature[:8], 16), 6), source="manual")
-            if weight:
-                order = replace(order, kg=weight)
-            ready = s.ground_model.ready(order)
-            order = match_order(s.network, replace(order, ready=ready))
-            options = dict(ground_model=s.ground_model, settings=settings)
-            normal = manual_preview(s.network, order, **options)
-            result = (manual_preview(s.network, order, s.disturbance, **options)
-                      if s.disturbance and s.disturbance.kind != "demand" else normal)
-            s.draft = draft = dict(signature=signature, order=order, ordered_at=ordered_at,
-                                   normal=normal, result=result, disturbance=s.disturbance,
-                                   confirmed=bool(same and draft["confirmed"]))
+            dispatcher = Dispatcher(s.network, s.ground_model, riders, fleet)
+            records, version = s.manual_store.confirmed_state(s.source, s.network_version)
+            state = saved_schedule(records)
+            if retry:
+                jobs = draft["pending"]
+            else:
+                jobs = []
+                for item in inputs:
+                    when = datetime.strptime(item["下单时间"], "%H:%M").time()
+                    stamp = datetime.combine(day, when).isoformat(timespec="minutes")
+                    coordinates = [float(item[field]) for field in fields]
+                    weight = float(item["重量 kg"])
+                    price = item["价格"]
+                    if not all(isfinite(x) for x in coordinates) or not isfinite(weight) or weight <= 0:
+                        raise ValueError("请填写有效坐标和正数重量")
+                    if price is not None and (not isfinite(float(price)) or float(price) < 0):
+                        raise ValueError("订单价格须为非负数")
+                    minute = clock(when)
+                    order = Order("M-" + uuid4().hex, minute, minute + 8, None, tuple(coordinates[:2]),
+                                  tuple(coordinates[2:]), businesses[item["业务"]], weight, price, source="manual")
+                    jobs.append(dispatcher.job(order, stamp))
+            now = max(max(job.arrival for job in jobs), draft["now"] if retry else 0)
+            with st.spinner("按当前骑手和无人机状态计算…"):
+                if len(jobs) == 1:
+                    ground, air, plan = dispatcher.immediate(jobs[0], state, now, threshold)
+                    plans, report = (plan,), None
+                else:
+                    jobs, plans, report = joint(dispatcher, jobs, state, now, threshold)
+                    ground = air = None
+            s.draft = draft = dict(signature=signature, input_key=input_key, now=now,
+                                   jobs=tuple(jobs), plans=plans, ground=ground, air=air,
+                                   report=report, version=version, confirmed=False, pending=(),
+                                   routes=dispatcher.routes)
+            same = True
         except DATA_ERRORS as error:
-            s.draft = draft = None
-            st.error(f"无法计算配送建议 · {error}")
-    if draft is None:
+            st.error(f"计算失败 · {error}")
+            return
+    if not same and not recorded:
         return
-    if draft["signature"] != signature:
-        st.info("订单输入已调整，重新计算后可确认。")
-        return
-    result_panel(draft)
+    jobs, plans = draft["jobs"], draft["plans"]
     if draft["confirmed"]:
-        st.success(f"订单 {draft['order'].id[:12]} 已确认，可在下方登记送达。")
-        if st.button("录入下一单"):
-            s.draft = None
-            st.rerun()
+        if draft["pending"]:
+            st.info(f"已确认可执行方案，{len(draft['pending'])} 笔待分配，可重新计算。")
+        else:
+            st.success("已确认配送计划，可在下方登记送达。")
+            if st.button("录入下一批"):
+                s.draft = None
+                s.order_revision = s.get("order_revision", 0) + 1
+                st.rerun()
         return
-    modes = [mode for mode in ("ground", "air") if draft["result"][f"{mode}_eta"] is not None]
-    if not modes:
-        st.info("当前两种方式都无法执行，等待资源恢复后可重新计算。")
-        return
-    recommended = draft["result"]["mode"]
-    widget_version = digest([draft["signature"], asdict(s.disturbance) if s.disturbance else None])[:14]
-    chosen = st.radio("人工确认方式", modes, index=modes.index(recommended) if recommended in modes else 0,
-                      format_func=MODES.get, key=f"manual_mode_{widget_version}", horizontal=True)
-    if st.button("确认送单方式", width="stretch"):
+    if draft["report"]:
+        report = draft["report"]
+        if report["fallback"]:
+            st.info("未找到完整可行的联合方案，按单笔规则分配可执行订单。")
+        else:
+            weighted, occupied, cost = report["objectives"]
+            st.caption(f"{report['pareto']} 个非支配方案 · 价值加权耗时 {weighted:.1f} · "
+                       f"骑手占用 {occupied:.0f} 分钟 · 配送成本 {cost:.2f} 元")
+    else:
+        ground, air = draft["ground"], draft["air"]
+        guide = guide_for(jobs[0], ground, air, plans[0])
+        cols = st.columns(2)
+        cols[0].metric("地面 ETA", hhmm(guide["ground_eta"]))
+        cols[1].metric("空地 ETA", hhmm(guide["air_eta"]))
+        if ground and air:
+            st.caption(f"空地预计节时 {ground.eta-air.eta:+d} 分钟 · {air.route}")
+        elif not air:
+            st.caption(jobs[0].order.eligibility if jobs[0].order.ground_only else "当前航空运力无法执行")
+        st.write(f"配送建议 · {MODES[guide['mode']]}")
+        options = {plan.mode: plan for plan in (ground, air) if plan}
+        if len(options) > 1:
+            modes = list(options)
+            chosen = st.radio("人工确认方式", modes, index=modes.index(guide["mode"]),
+                              format_func=MODES.get, horizontal=True, key=f"manual_mode_{revision}_{signature[:10]}")
+            plans = (options[chosen],)
+    st.dataframe(output_rows(jobs, plans, draft["routes"]), hide_index=True)
+    render_reservations(jobs, plans)
+    if st.button("确认可执行配送方案", disabled=not any(plans)):
         try:
-            saved = ManualRecord(draft["order"], s.source, s.network_version, draft["ordered_at"],
-                                 draft["normal"], draft["result"],
-                                 asdict(draft["disturbance"]) if draft["disturbance"] else None, chosen,
-                                 chosen_route_id=draft["result"].get("air_route_id") if chosen == "air" else None)
-            s.manual_store.confirm(saved)
+            records = []
+            for job, plan in zip(jobs, plans):
+                if not plan:
+                    continue
+                ground, air = ((draft["ground"], draft["air"]) if not draft["report"] else
+                               (plan if plan.mode == "ground" else None, plan if plan.mode == "air" else None))
+                guide = guide_for(job, ground, air, draft["plans"][0] if not draft["report"] else plan)
+                records.append(ManualRecord(job.order, s.source, s.network_version, job.ordered_at,
+                                            guide, guide, None, plan.mode, chosen_route_id=plan.route,
+                                            reservation=asdict(plan)))
+            s.manual_store.confirm_plans(records, s.source, s.network_version, draft["version"])
+            draft["pending"] = tuple(job for job, plan in zip(jobs, plans) if not plan)
             draft["confirmed"] = True
             st.rerun()
         except DATA_ERRORS as error:
@@ -512,228 +435,20 @@ def manual_history():
             st.caption("确认配送方式后，可以在这里登记实际送达。")
 
 
-def resource_panel(count):
+def resource_panel():
     s = st.session_state
-    key = (s.map_revision, s.network_version, count)
-    if s.get("auto_resources_key") != key:
-        automatic = operating_settings(s.operation_profile, s.network, count)
-        orders = generate(s.operation_profile, count, 201)
-        automatic["aircraft_by_hub"] = fleet_estimate(s.network, orders)
-        s.auto_resources, s.auto_resources_key = automatic, key
-    settings = dict(s.auto_resources)
+    hubs = sorted({site["id"] for site in s.network.candidates if site["active"] and site["role"] == "Hub"}
+                  | {route.hub for route in s.network.routes})
+    slots = ("00:00–08:00", "08:00–16:00", "16:00–24:00")
     with st.sidebar.expander("运力配置"):
-        st.caption(f"默认高峰在线 {max(settings['rider_hours'])} 名骑手，"
-                   f"全网 {sum(settings['aircraft_by_hub'].values())} 架无人机。"
-                   "骑手班次按每人每小时 3 单估算，仿真按实际任务耗时逐单占用骑手。")
-        manual = st.checkbox("手动设置骑手和无人机")
-        hours = pd.DataFrame({"时段": [f"{hour:02d}:00" for hour in range(24)], "在线骑手": settings["rider_hours"]})
-        fleet = pd.DataFrame({"Hub": list(settings["aircraft_by_hub"]),
-                              "无人机": list(settings["aircraft_by_hub"].values())})
-        editor_key = digest(key)[:12]
-        if manual:
-            hours = st.data_editor(hours, key=f"rider_hours_{editor_key}", hide_index=True,
-                                   disabled=["时段"], column_config={"在线骑手": st.column_config.NumberColumn(
-                                       required=True, min_value=0, max_value=500, step=1)})
-            if not fleet.empty:
-                fleet = st.data_editor(fleet, key=f"fleet_{editor_key}", hide_index=True, disabled=["Hub"],
-                                       column_config={"无人机": st.column_config.NumberColumn(
-                                           required=True, min_value=0, max_value=100, step=1)})
-        else:
-            st.dataframe(hours, hide_index=True, height=180)
-            if not fleet.empty:
-                st.dataframe(fleet, hide_index=True, height=155)
-        settings["rider_hours"] = hours["在线骑手"].astype(int).tolist()
-        settings["aircraft_by_hub"] = {hub: int(count) for hub, count in zip(fleet.Hub, fleet["无人机"])}
-        if manual:
-            st.caption(f"当前高峰在线 {max(settings['rider_hours'])} 人，共 {sum(settings['aircraft_by_hub'].values())} 架无人机。")
-        for field, label, default in (("battery", "每 Hub 备用电池", 6), ("pads", "每站起降位", 1),
-                                       ("swap", "每 Hub 换电位", 1), ("charge", "每 Hub 充电位", 2)):
-            settings[field] = st.number_input(label, 0, 100, default, step=1)
-    return settings
+        riders = tuple(st.number_input(f"{label} 骑手数", min_value=0, value=count, step=1,
+                                       key=f"riders_{s.map_revision}_{i}")
+                       for i, (label, count) in enumerate(zip(slots, s.default_staff)))
+        fleet = {hub: st.number_input(f"{hub} 无人机数", 0, 100, 5, key=f"fleet_{s.map_revision}_{hub}")
+                 for hub in hubs}
+    return riders, fleet
 
 
-def show_comparison(rows, suffix):
-    if not rows:
-        return
-
-    def formatted(value, pattern):
-        return format(value, pattern) if value is not None else "无配对样本"
-
-    table = []
-    for row in rows:
-        table.append({"策略": STRATEGIES[row["strategy"]], "已送达／到达": f"{row['completed']}／{row['arrivals']}",
-                      "完成率": formatted(row["completion_rate"], ".1%"), "未送达": row["undelivered"],
-                      "配对单数": row["paired_orders"], "单均节省（分钟）": formatted(row["saved_minutes"], "+.1f"),
-                      "耗时降幅": formatted(row["time_reduction"], "+.1%"),
-                      "仅地面配对数": row["paired_ground"],
-                      "仅地面少等（分钟）": formatted(row["saved_ground_wait"], "+.1f"),
-                      "仅地面 P90 缩短（分钟）": formatted(row["saved_ground_p90"], "+.1f"),
-                      "净节省骑手分钟": row["saved_rider_minutes"]})
-    st.caption("与纯地面逐单配对。时长只计两侧均已送达的订单。节省为负表示耗时或占用增加。")
-    st.dataframe(table, hide_index=True, width="stretch")
-    breakdown = pd.DataFrame([{"策略": STRATEGIES[row["strategy"]], "时段": hhmm(item["hour"]*60),
-                               "区域": f"骑手初始区域 {item['zone']}", "任务": item["activity"],
-                               "骑手分钟": item["minutes"]}
-                              for row in rows for item in row["rider_breakdown"]])
-    if not breakdown.empty:
-        st.markdown("**骑手占用**")
-        choice = st.radio("查看维度", ["按策略", "按时段和区域"], horizontal=True)
-        if choice == "按时段和区域":
-            names = list(breakdown["策略"].unique())
-            strategy, region = st.columns(2)
-            name = strategy.selectbox("策略", names)
-            zone = region.selectbox("骑手初始区域", ["全部", *sorted(breakdown["区域"].unique())])
-            breakdown = breakdown[breakdown["策略"].eq(name)]
-            if zone != "全部":
-                breakdown = breakdown[breakdown["区域"].eq(zone)]
-        dimension = "策略" if choice == "按策略" else "时段"
-        chart = breakdown.groupby([dimension, "任务"], as_index=False)["骑手分钟"].sum()
-        st.bar_chart(chart, x=dimension, y="骑手分钟", color="任务", stack=True)
-
-    case_row = next((row for row in reversed(rows) if row.get("example")), None)
-    with st.expander("查看骑手时间重新分配案例"):
-        if case_row:
-            case = case_row["example"]
-            st.write(f"{STRATEGIES[case_row['strategy']]}中，可飞单 {case['flyable']} 改为空地接驳。"
-                     f"骑手 {case['rider']} 在 {hhmm(case['start'])} 至 {hhmm(case['end'])} "
-                     f"为仅地面单 {case['ground_only']} 服务，该单提前 {case['earlier_start']} 分钟派发、"
-                     f"提前 {case['earlier_delivery']} 分钟送达。")
-        else:
-            st.caption("本轮已完成策略中没有找到可核对的同骑手转用案例。")
-
-    show_diagnostics(rows, suffix)
-    flat = [{k: v for k, v in row.items() if not isinstance(v, (dict, list))} for row in rows]
-    first, second = st.columns(2)
-    first.download_button("下载对照 CSV", pd.DataFrame(flat).to_csv(index=False).encode("utf-8-sig"),
-                          "batch.csv", "text/csv", on_click="ignore", key=f"batch_csv_{suffix}")
-    second.download_button("下载完整结果 JSON", encode(rows), "batch.json", "application/json",
-                           on_click="ignore", key=f"batch_json_{suffix}")
-
-
-
-def show_diagnostics(rows, suffix):
-    with st.expander("耗时、运力与航段诊断"):
-        summary, stages, riders, hubs, routes = st.tabs(["耗时分布", "阶段耗时", "骑手班次", "Hub 资源", "执行航段"])
-        with summary:
-            search = next((r.get("lookahead_search") for r in rows if r["strategy"] == "lookahead"), None)
-            if search:
-                edited = sum(search.get(kind, 0) for kind in ("ground", "air", "ground_first", "event_wait"))
-                st.caption(f"多订单试排最多比较 {search['window']} 笔其他订单。"
-                           f"联合决策改变 {edited} 次，主动等待 {search.get('active_wait_minutes', 0)} 分钟。")
-            st.dataframe([{"策略": STRATEGIES[r["strategy"]], "空间可接入航网": r["air_eligible_orders"],
-                           "实际空运送达": r["delivered_air_orders"], "实际地面送达": r["delivered_ground_orders"],
-                           "平均耗时": r["mean_minutes"], "P50": r["p50_minutes"], "P90": r["p90_minutes"],
-                           "执行航段改变": r["reselected_route_orders"]} for r in rows],
-                         hide_index=True, width="stretch")
-        with stages:
-            st.caption("按实际送达方式分别求均值，单位为分钟。末段空驶、飞机占用和电池周转可与配送并行。")
-            st.dataframe([{"策略": STRATEGIES[r["strategy"]], "送达方式": MODES[mode],
-                           "阶段": STAGES[stage], "平均分钟": round(value, 2),
-                           "计入端到端": stage not in NON_ADDITIVE}
-                          for r in rows for mode, names in MODE_STAGES.items() for stage in names
-                          if (value := r[f"{mode}_{stage}_mean_minutes"]) is not None],
-                         hide_index=True, width="stretch")
-        tables = diagnostic_tables(rows)
-        with riders:
-            st.caption("预订空档为任务已预约但骑手尚未开始该任务的空闲分钟。利用率计入换班后仍在执行的任务。")
-            frame = pd.DataFrame(tables["rider_hourly"])
-            if not frame.empty:
-                frame["hour"] = frame["hour"].map(lambda hour: hhmm(hour * 60))
-                frame["strategy"] = frame["strategy"].map(STRATEGIES)
-                st.dataframe(frame.rename(columns={"strategy": "策略", "hour": "小时",
-                    "scheduled_riders": "计划在线", "scheduled_minutes": "计划骑手分钟",
-                    "worked_minutes": "实际骑手分钟", "tasks_started": "开始任务数",
-                    "carryover_minutes": "跨班骑手分钟", "reserved_idle_minutes": "预订空档分钟",
-                    "utilization": "利用率"}).drop(columns=["seed", "scenario"]), hide_index=True, width="stretch",
-                    column_config={"利用率": st.column_config.NumberColumn(format="percent")})
-        with hubs:
-            frame = pd.DataFrame(tables["hub_resources"])
-            if frame.empty:
-                st.caption("当前航网没有 Hub。")
-            else:
-                frame["strategy"] = frame["strategy"].map(STRATEGIES)
-                groups = {"aircraft": "飞机", "pad": "Hub 起降位", "swap": "换电位",
-                          "charge": "充电位", "battery": "电池"}
-                frame["resource"] = frame["resource"].map(groups)
-                st.dataframe(frame.rename(columns={"strategy": "策略", "tasks": "航空任务数", "resource": "资源",
-                    "used": "占用分钟", "available": "可用分钟", "ratio": "利用率"})
-                    .drop(columns=["seed", "scenario"]), hide_index=True, width="stretch",
-                    column_config={"利用率": st.column_config.NumberColumn(format="percent")})
-        with routes:
-            cases = [{"策略": STRATEGIES[r["strategy"]], "仿真订单": case["order"],
-                      "空间首选": case["preferred_route_id"], "执行航段": case["executed_route_id"],
-                      "首选 ETA": hhmm(case["preferred_eta"]), "执行 ETA": hhmm(case["executed_eta"]),
-                      "预计少用分钟": case["minutes_saved"]} for r in rows for case in r["route_examples"]]
-            if cases:
-                st.dataframe(cases, hide_index=True, width="stretch")
-            else:
-                st.caption("本轮没有找到在同一调度时刻可比较且降低 ETA 的换段案例。")
-        buttons = st.columns(3)
-        for button, (key, label) in zip(buttons, (("rider_hourly", "骑手班次 CSV"),
-                ("hub_resources", "Hub 资源 CSV"), ("order_diagnostics", "订单与航段 CSV"))):
-            if tables[key]:
-                button.download_button(label, pd.DataFrame(tables[key]).to_csv(index=False).encode("utf-8-sig"),
-                                       f"{key}.csv", "text/csv", on_click="ignore",
-                                       key=f"{key}_{suffix}")
-
-
-def batch_panel(settings):
-    s = st.session_state
-    st.subheader("配送效率对照")
-    job = s.get("batch")
-    busy = bool(job and not job["future"].done())
-    count_col, action = st.columns([1, 1.45], vertical_alignment="bottom")
-    count = count_col.number_input("本轮仿真订单数", 1, 500, 201, step=1, key="efficiency_count")
-    ready = s.operation_profile is not None
-    if action.button("运行配送效率对照", type="primary", width="stretch", disabled=busy or not ready):
-        try:
-            profile = s.operation_profile
-            queues, cancelled = SimpleQueue(), Event()
-            network, disturbance = s.network, s.disturbance
-            future = worker_pool().submit(run_batch, profile, network, (201,), ("normal",),
-                                          orders_per_day=count, disturbance=disturbance, settings=settings,
-                                          ground_model=s.ground_model, include_orders=True,
-                                          cancelled=cancelled.is_set, progress=queues.put)
-            s.batch = {"future": future, "queue": queues, "cancelled": cancelled, "rows": [],
-                       "count": count, "version": s.network_version, "done": False, "disturbance": disturbance,
-                       "peak_riders": max(settings["rider_hours"]), "fleet": sum(settings["aircraft_by_hub"].values())}
-            st.rerun()
-        except DATA_ERRORS as error:
-            st.error(f"无法启动策略对照 · {error}")
-    if job:
-        @st.fragment(run_every=1.0 if busy else None)
-        def progress_panel():
-            while True:
-                try:
-                    job["rows"].append(job["queue"].get_nowait())
-                except Empty:
-                    break
-            changed = job["disturbance"]
-            condition = f" · {DISTURBANCES[changed.kind]} {changed.percent}%" if changed else ""
-            st.caption(f"本次输入 · {job['count']} 单 · 高峰在线 {job['peak_riders']} 名骑手 · "
-                       f"{job['fleet']} 架无人机 · 航网 {job['version'][:12]}{condition}")
-            count_done = len(job["rows"])
-            st.progress(count_done / len(STRATEGIES), text=f"策略已完成 {count_done}／{len(STRATEGIES)}")
-            if job["future"].done():
-                if busy and not job["done"]:
-                    job["done"] = True
-                    st.rerun()
-                if error := job["future"].exception():
-                    st.error(f"配送效率对照失败 · {error}")
-                elif job["cancelled"].is_set() and count_done < len(STRATEGIES):
-                    st.info("已取消。下方显示本次已完成的策略。")
-                if count_done < len(STRATEGIES):
-                    missing = set(STRATEGIES) - {row["strategy"] for row in job["rows"]}
-                    st.caption("未完成 · " + "、".join(label for key, label in STRATEGIES.items() if key in missing))
-                show_comparison(job["rows"], "current")
-            elif job["cancelled"].is_set():
-                st.caption("正在停止当前策略…")
-            elif st.button("取消对照"):
-                job["cancelled"].set()
-        progress_panel()
-
-
-@st.cache_data(show_spinner=False)
 def header_logo():
     return b64encode((ROOT / "assets" / "cauc.png").read_bytes()).decode("ascii")
 
@@ -747,14 +462,12 @@ def main():
                 f'<h1 class="app-title">{TITLE}</h1>'
                 '<div class="app-subtitle">Drone Delivery Network and Air–Ground Dispatch</div></div>',
                 unsafe_allow_html=True)
-    rules, settings = planning_settings()
-    data_panel(rules, settings)
+    data_panel(planning_settings())
     s = st.session_state
     network = s.network
     if network is None:
         return
-    disturbance_panel()
-    settings = resource_panel(s.get("efficiency_count", 201))
+    riders, fleet = resource_panel()
     defaults = ((network.routes[0].pickup, network.routes[0].dropoff) if network.routes
                 else (network.origin, network.origin))
     st.divider()
@@ -762,7 +475,5 @@ def main():
     with map_column:
         map_panel(defaults)
     with order_column:
-        order_panel(defaults, settings)
+        order_panel(defaults, riders, fleet)
     manual_history()
-    st.divider()
-    batch_panel(settings)

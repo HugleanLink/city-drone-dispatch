@@ -7,12 +7,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from .calibration import fit
-from .diagnostics import diagnostic_tables
-from .data import KEYS, Profile, generate, prepare, profile_for_groups, sources
-from .model import Network, Order
-from .network import build, covered_rows
-from .batch import SCENARIOS, run_batch, write_results
+from .data import KEYS, Profile, day_groups, planning_sample, prepare, profile_for_groups
+from .deployment import deploy
+from .model import Order
+from .speed import fit_hourly
 
 
 def save(path,value):
@@ -41,19 +39,11 @@ def main():
     prep=sub.add_parser("prepare-data")
     prep.add_argument("--input",required=True,type=Path); prep.add_argument("--mapping",type=Path)
     prep.add_argument("--out",required=True,type=Path)
-    gen=sub.add_parser("generate")
-    gen.add_argument("--profile",required=True,type=Path); gen.add_argument("--purpose",choices=["planning","operation","heavy"],required=True)
-    gen.add_argument("--seed",required=True,type=int); gen.add_argument("--count",required=True,type=int)
-    gen.add_argument("--out",required=True,type=Path)
     net=sub.add_parser("build-network")
-    net.add_argument("--orders",required=True,type=Path); net.add_argument("--profile",type=Path)
+    net.add_argument("--profile",required=True,type=Path)
+    net.add_argument("--orders",type=Path,help="可选：读取事先导出的历史规划订单")
+    net.add_argument("--count",type=int,help="规划抽样数量，省略时使用完整历史来源")
     net.add_argument("--out",required=True,type=Path)
-    bat=sub.add_parser("batch")
-    bat.add_argument("--profile",required=True,type=Path); bat.add_argument("--network",required=True,type=Path)
-    bat.add_argument("--seeds",default="201:230"); bat.add_argument("--scenarios",nargs="+",choices=SCENARIOS,default=list(SCENARIOS))
-    bat.add_argument("--orders", "--orders-per-day", dest="orders_per_day", type=int,
-                     help="覆盖每轮仿真的默认订单数")
-    bat.add_argument("--out",required=True,type=Path)
     serve=sub.add_parser("serve"); serve.add_argument("--port",default=8501,type=int); serve.add_argument("--workspace",type=Path)
     args=parser.parse_args()
     if args.action=="serve":
@@ -69,35 +59,19 @@ def main():
         profile.rows.to_csv(args.out/"profile.csv.gz",index=False)
         save(args.out/"profile.meta.json",{"schema_version":1,"origin":profile.origin,"report":profile.report})
         print(profile.report)
-    if args.action=="generate":
-        orders=generate(load_profile(args.profile),args.count,args.seed,args.purpose)
-        save(args.out/"orders.json",[asdict(o) for o in orders])
-        pd.DataFrame([asdict(o) for o in orders]).to_csv(args.out/"orders.csv",index=False,encoding="utf-8-sig")
     if args.action=="build-network":
-        orders=[Order.from_dict(o) for o in read(args.orders)]
-        profile=load_profile(args.profile) if args.profile else None
-        network=build(orders,profile.origin if profile else None,extent=profile_extent(profile) if profile else None)
+        profile=load_profile(args.profile)
+        profile=profile_for_groups(profile, day_groups(profile))
+        if not {"pre_pickup", "reference_minutes"} <= set(profile.rows):
+            parser.error("请先运行 prepare-data 以生成地面耗时字段")
+        orders = ([Order.from_dict(o) for o in read(args.orders)] if args.orders else
+                  planning_sample(profile, args.count))
+        network=deploy(orders,profile.origin,profile_extent(profile))
         save(args.out/"network.json",asdict(network))
-        save(args.out/"coverage.json",covered_rows(network,orders))
+        save(args.out/"ground-speeds.json",asdict(fit_hourly(profile)))
         save(args.out/"road_graph.json",road_graph(network))
         pd.DataFrame(network.candidates).to_csv(args.out/"candidates.csv",index=False,encoding="utf-8-sig")
         print(network.diagnostics)
-    if args.action=="batch":
-        profile=load_profile(args.profile)
-        network=Network.from_dict(read(args.network))
-        seed=args.seeds.split(":")
-        seeds=range(int(seed[0]),int(seed[-1])+1)
-        if not {"pre_pickup", "reference_minutes"} <= set(profile.rows):
-            parser.error("请先重新运行 prepare-data 以生成地面耗时校准字段")
-        ground_model = fit(profile_for_groups(profile, sources(profile)["planning"]))
-        rows = run_batch(profile, network, seeds, args.scenarios, orders_per_day=args.orders_per_day,
-                         ground_model=ground_model, include_orders=True,
-                         progress=lambda row: print(row["scenario"], row["seed"], row["strategy"], flush=True))
-        save(args.out/"batch.json",rows)
-        write_results(rows,args.out/"batch.csv")
-        for name, table in diagnostic_tables(rows).items():
-            if table:
-                pd.DataFrame(table).to_csv(args.out / f"{name}.csv", index=False, encoding="utf-8-sig")
     return 0
 
 
